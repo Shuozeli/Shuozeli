@@ -1,5 +1,7 @@
 # pidx Design
 
+Last updated: 2026-03-19
+
 ## Problem
 
 Managing 13+ active repos requires a single dashboard for health, velocity, and progress. Manual tracking does not scale. LLMs can provide richer analysis but need structured input.
@@ -18,9 +20,12 @@ Repos are explicitly listed in config. This prevents noise from forks, archived 
 
 ### Health Score Formula
 Composite of three signals:
-- **Recency** (40%): How recently was code pushed? Active projects push frequently.
-- **Velocity** (40%): Commit count over 30 days. Measures sustained effort.
-- **Issues** (20%): Open issue count. High counts suggest maintenance debt.
+- **Recency** (40%): How recently was code pushed? 100 if pushed within 3 days, linear decay to 0 at 90 days.
+- **Velocity** (40%): Commit count over 30 days. 10+ commits scores 100.
+- **Issues** (20%): 100 if 0 open issues, -10 per open issue, minimum 0.
+
+Health labels derived from the composite score:
+- **Active** (>=80), **Healthy** (>=60), **Moderate** (>=40), **Stale** (>=20), **Dormant** (<20).
 
 ### Docs as LLM Interface
 Rather than calling LLM APIs directly, pidx exports structured markdown that any LLM can process. This keeps pidx simple and LLM-agnostic.

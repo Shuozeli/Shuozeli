@@ -85,6 +85,42 @@ pub fn count_commits_since(
     Ok(count)
 }
 
+pub fn get_commits_between(
+    conn: &Connection,
+    repo_id: i64,
+    since: &str,
+    until: &str,
+) -> anyhow::Result<Vec<CommitRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, repo_id, sha, message, author, committed_at, category
+             FROM commits
+             WHERE repo_id = ?1 AND committed_at >= ?2 AND committed_at < ?3
+             ORDER BY committed_at DESC",
+        )
+        .context("Failed to prepare commit query")?;
+
+    let rows = stmt
+        .query_map(params![repo_id, since, until], |row| {
+            Ok(CommitRow {
+                id: row.get(0)?,
+                repo_id: row.get(1)?,
+                sha: row.get(2)?,
+                message: row.get(3)?,
+                author: row.get(4)?,
+                committed_at: row.get(5)?,
+                category: row.get(6)?,
+            })
+        })
+        .context("Failed to query commits")?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.context("Failed to read commit row")?);
+    }
+    Ok(result)
+}
+
 pub fn get_all_commits_for_repo(
     conn: &Connection,
     repo_id: i64,

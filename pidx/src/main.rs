@@ -58,10 +58,30 @@ enum Commands {
         action: DocsAction,
     },
 
+    /// Export weekly changelog data for agent consumption
+    Changelog {
+        #[command(subcommand)]
+        action: ChangelogAction,
+    },
+
     /// Display current config
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChangelogAction {
+    /// Export raw weekly data as structured markdown per repo
+    Export {
+        /// ISO week (e.g. 2026-W12). Defaults to current week.
+        #[arg(long)]
+        week: Option<String>,
+
+        /// Export only this repo
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -123,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
             }
             DocsAction::Ingest { repo } => {
                 commands::docs_command::ingest(&config, repo.as_deref())?;
+            }
+        },
+        Commands::Changelog { action } => match action {
+            ChangelogAction::Export { week, repo } => {
+                commands::changelog_command::export(&config, week.as_deref(), repo.as_deref())?;
             }
         },
         Commands::Config { action } => match action {
