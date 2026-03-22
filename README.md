@@ -42,6 +42,7 @@ A catalog of my open-source projects.
 |---------|----------|-------------|
 | [issue-tracker-lite](https://github.com/Shuozeli/issue-tracker-lite) | Rust | Rebuild of Google Issue Tracker as a Rust gRPC server + CLI client + React web UI, backed by SQLite via Quiver ORM |
 | [pwright](https://github.com/Shuozeli/pwright) | Rust | Lightweight CLI for browser automation via Chrome DevTools Protocol using a snapshot-act-snapshot workflow |
+| [myfeed](https://github.com/Shuozeli/myfeed) | Rust | Personal feed bot that crawls Reddit, Zhihu, Weibo, and X via pwright browser automation and sends updates to Telegram |
 | [beu](https://github.com/Shuozeli/beu) | Rust | Persistent session memory CLI for AI coding agents (Claude Code, Gemini CLI, etc.) backed by local SQLite |
 
 ### Platforms & Dashboards
