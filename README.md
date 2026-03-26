@@ -51,3 +51,9 @@ A catalog of my open-source projects.
 |---------|----------|-------------|
 | [open-plx](https://github.com/Shuozeli/open-plx) | Rust | Open-source server-driven dashboard platform (PLX alternative) built with tonic, Arrow Flight, and React |
 
+### AI Agent Pipelines
+
+| Project | Language | Description |
+|---------|----------|-------------|
+| [ai-pipelines](https://github.com/Shuozeli/ai-pipelines) | Markdown | Reusable multi-phase prompt pipelines for AI coding agents (code review, doc update, etc.) |
+
