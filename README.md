@@ -51,6 +51,12 @@ A catalog of my open-source projects.
 |---------|----------|-------------|
 | [open-plx](https://github.com/Shuozeli/open-plx) | Rust | Open-source server-driven dashboard platform (PLX alternative) built with tonic, Arrow Flight, and React |
 
+### AI Infrastructure
+
+| Project | Language | Description |
+|---------|----------|-------------|
+| [litevikings](https://github.com/Shuozeli/litevikings) | Rust | Context database for AI agents that organizes memories, resources, and skills into a semantic-searchable virtual filesystem, backed by DuckDB with LLM integration |
+
 ### AI Agent Pipelines
 
 | Project | Language | Description |
