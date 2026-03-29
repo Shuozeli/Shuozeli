@@ -44,6 +44,7 @@ I build systems software in Rust -- compilers, databases, networking, and develo
 | [pwright](https://github.com/Shuozeli/pwright) | Rust | Lightweight CLI for browser automation via Chrome DevTools Protocol using a snapshot-act-snapshot workflow |
 | [myfeed](https://github.com/Shuozeli/myfeed) | Rust | Personal feed bot that crawls Reddit, Zhihu, Weibo, and X via pwright browser automation and sends updates to Telegram |
 | [beu](https://github.com/Shuozeli/beu) | Rust | Persistent session memory CLI for AI coding agents (Claude Code, Gemini CLI, etc.) backed by local SQLite |
+| [rterm](https://github.com/Shuozeli/rterm) | Rust | Terminal emulator in the browser via egui WASM + WebTransport, with VT100/VT220 emulation and gRPC/HTTP/3 relay |
 
 ### Platforms & Dashboards
 
