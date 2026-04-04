@@ -28,6 +28,7 @@ I build systems software in Rust -- compilers, databases, networking, and develo
 | [quiver-orm](https://github.com/Shuozeli/quiver-orm) | Rust | Arrow-native ORM where schema types map 1:1 to Apache Arrow types, with ADBC connectivity and multi-format codegen from `.quiver` schema files |
 | [arrow-adbc-rs](https://github.com/Shuozeli/arrow-adbc-rs) | Rust | Clean-room Rust ADBC (Arrow Database Connectivity) with drivers for FlightSQL, SQLite, PostgreSQL, and MySQL |
 | [prisma-rs](https://github.com/Shuozeli/prisma-rs) | Rust | Pure Rust drop-in replacement for Prisma ORM with query engine, multiple database drivers, and migration engine |
+| [stonedb](https://github.com/stonedb/stonedb) | Rust | Pure Rust LSM-tree database with SkipList, MemTable, Timeline system for debugging/replay |
 
 ### Infrastructure & Networking
 
