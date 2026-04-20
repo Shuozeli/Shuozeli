@@ -64,6 +64,7 @@ I build systems software in Rust -- compilers, databases, networking, and develo
 
 | Project | Language | Description |
 |---------|----------|-------------|
+| [apple-ml-server](https://github.com/Shuozeli/apple-ml-server) | Swift/Rust | Pure Swift gRPC ML inference server with OCR (Vision.framework) and speech-to-text (Speech.framework), Rust SDK, and CLI client |
 | [litevikings](https://github.com/Shuozeli/litevikings) | Rust | Context database for AI agents that organizes memories, resources, and skills into a semantic-searchable virtual filesystem, backed by DuckDB with LLM integration |
 
 ### AI Agent Pipelines
