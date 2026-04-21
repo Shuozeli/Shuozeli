@@ -47,6 +47,7 @@ I build systems software in Rust -- compilers, databases, networking, and develo
 
 | Project | Language | Description |
 |---------|----------|-------------|
+| [telesync](https://github.com/Shuozeli/telesync) | Rust | Git-to-Telegraph sync tool -- reconciles markdown files with Telegraph pages with crash-safe state and content safety denylist |
 | [yt-dlp-rs](https://github.com/Shuozeli/yt-dlp-rs) | Rust | yt-dlp gRPC server + CLI client for video downloading and information extraction, with transcript support |
 | [issue-tracker-lite](https://github.com/Shuozeli/issue-tracker-lite) | Rust | Rebuild of Google Issue Tracker as a Rust gRPC server + CLI client + React web UI, backed by SQLite via Quiver ORM |
 | [pwright](https://github.com/Shuozeli/pwright) | Rust | Lightweight CLI for browser automation via Chrome DevTools Protocol using a snapshot-act-snapshot workflow |
