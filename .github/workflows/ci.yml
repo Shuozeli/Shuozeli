@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pre-commit-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check for trailing whitespace
+        run: |
+          found=false
+          while IFS= read -r -d '' file; do
+            if grep -q '[[:space:]]$' "$file"; then
+              echo "Trailing whitespace in: $file"
+              found=true
+            fi
+          done < <(git ls-files -z)
+          if $found; then exit 1; fi
+
+      - name: Check for merge conflicts
+        run: |
+          if git grep --cached -l '^<<<<<<< '; then
+            echo "Merge conflict markers found"
+            exit 1
+          fi
+
+      - name: Check YAML files are valid
+        run: |
+          for f in $(git ls-files | grep '\.ya\?ml$'); do
+            python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null || {
+              echo "Invalid YAML: $f"
+              exit 1
+            }
+          done
+
+  docs-checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - protobuf-rs
+          - flatbuffers-rs
+          - quiver-orm
+          - pure-grpc-rs
+          - pidx
+          - openworkspace
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: docs/${{ matrix.project }}
+
+      - name: Check for CLAUDE.md
+        run: |
+          if [ ! -f "docs/${{ matrix.project }}/CLAUDE.md" ]; then
+            echo "Missing CLAUDE.md in ${{ matrix.project }}"
+            exit 1
+          fi
+
+      - name: Check for README.md
+        run: |
+          if [ ! -f "docs/${{ matrix.project }}/README.md" ]; then
+            echo "Missing README.md in ${{ matrix.project }}"
+            exit 1
+          fi
