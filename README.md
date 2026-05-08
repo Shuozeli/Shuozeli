@@ -19,6 +19,12 @@ I build systems software in Rust -- compilers, databases, networking, and develo
 |---------|----------|-------------|
 | [codegen-infra](https://github.com/Shuozeli/codegen-infra) | Rust | Unified code generation framework with adapters for FlatBuffers, Protobuf, and Quiver-ORM schemas, and code writers for Rust, Dart, and TypeScript |
 
+### Schema Management
+
+| Project | Language | Description |
+|---------|----------|-------------|
+| [schemahub](https://github.com/Shuozeli/schemahub) | Rust | General-purpose schema registry server (Protobuf, FlatBuffers, OpenAPI) with git-style versioning, gRPC + CLI, and agent-friendly AST traversal |
+
 ### Binary Visualizers
 
 | Project | Language | Description |
