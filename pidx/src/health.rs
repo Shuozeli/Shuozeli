@@ -38,6 +38,17 @@ impl HealthLabel {
             HealthLabel::Dormant => "Dormant",
         }
     }
+
+    /// shields.io-compatible color name used to render this label as a badge.
+    pub fn shield_color(&self) -> &'static str {
+        match self {
+            HealthLabel::Active => "brightgreen",
+            HealthLabel::Healthy => "green",
+            HealthLabel::Moderate => "yellow",
+            HealthLabel::Stale => "orange",
+            HealthLabel::Dormant => "lightgrey",
+        }
+    }
 }
 
 impl std::fmt::Display for HealthLabel {

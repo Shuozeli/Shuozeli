@@ -79,6 +79,7 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
                 .or_else(|| repo.description.clone())
                 .unwrap_or_default(),
             health_label: health.label.as_str().to_string(),
+            health_color: health.label.shield_color().to_string(),
             health_score: health.total,
         });
     }
@@ -100,14 +101,19 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
             .unwrap_or(cat.as_str());
 
         out.push_str(&format!("### {title}\n\n"));
-        out.push_str("| Project | Language | Description |\n");
-        out.push_str("|---------|----------|-------------|\n");
+        out.push_str("| Project | Language | Description | Status |\n");
+        out.push_str("|---------|----------|-------------|--------|\n");
 
         if let Some(entries) = by_category.get(cat) {
             for entry in entries {
                 out.push_str(&format!(
-                    "| [{}](https://github.com/{}/{}) | {} | {} |\n",
-                    entry.name, entry.owner, entry.name, entry.language, entry.description,
+                    "| [{}](https://github.com/{}/{}) | {} | {} | {} |\n",
+                    entry.name,
+                    entry.owner,
+                    entry.name,
+                    entry.language,
+                    entry.description,
+                    render_status_badges(entry),
                 ));
             }
         }
@@ -127,5 +133,116 @@ struct RepoIndexEntry {
     language: String,
     description: String,
     health_label: String,
+    health_color: String,
+    #[allow(dead_code)]
     health_score: f64,
+}
+
+/// Render the inline shields.io badges for a repo's Status cell.
+///
+/// Six badges, all flat-square, ordered for left-to-right scanning
+/// (health-first, then activity, then backlog, then metadata):
+///   1. CI workflow status (always points at `ci.yml`)
+///   2. Last commit (activity recency — surfaces stale repos)
+///   3. Open issue count
+///   4. Open PR count
+///   5. License (quick legal scan)
+///   6. Health label, colored by `HealthLabel::shield_color()`
+fn render_status_badges(e: &RepoIndexEntry) -> String {
+    let ci = format!(
+        "![CI](https://img.shields.io/github/actions/workflow/status/{}/{}/ci.yml?branch=main&style=flat-square&label=CI)",
+        e.owner, e.name,
+    );
+    let last_commit = format!(
+        "![Last commit](https://img.shields.io/github/last-commit/{}/{}?style=flat-square&label=last)",
+        e.owner, e.name,
+    );
+    let issues = format!(
+        "![Issues](https://img.shields.io/github/issues/{}/{}?style=flat-square&label=issues)",
+        e.owner, e.name,
+    );
+    let prs = format!(
+        "![PRs](https://img.shields.io/github/issues-pr/{}/{}?style=flat-square&label=PRs)",
+        e.owner, e.name,
+    );
+    let license = format!(
+        "![License](https://img.shields.io/github/license/{}/{}?style=flat-square)",
+        e.owner, e.name,
+    );
+    let health = format!(
+        "![Health](https://img.shields.io/badge/health-{}-{}?style=flat-square)",
+        e.health_label, e.health_color,
+    );
+    format!("{ci} {last_commit} {issues} {prs} {license} {health}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(owner: &str, name: &str, label: &str, color: &str) -> RepoIndexEntry {
+        RepoIndexEntry {
+            name: name.into(),
+            owner: owner.into(),
+            language: "Rust".into(),
+            description: "x".into(),
+            health_label: label.into(),
+            health_color: color.into(),
+            health_score: 80.0,
+        }
+    }
+
+    #[test]
+    fn status_badges_emits_all_six_badge_kinds() {
+        // Arrange / Act
+        let s = render_status_badges(&entry("Shuozeli", "protobuf-rs", "Active", "brightgreen"));
+
+        // Assert: every badge URL we promised is present, in any order
+        // the formatter produces.
+        assert!(s.contains("/github/actions/workflow/status/Shuozeli/protobuf-rs/ci.yml"));
+        assert!(s.contains("/github/last-commit/Shuozeli/protobuf-rs"));
+        assert!(s.contains("/github/issues/Shuozeli/protobuf-rs"));
+        assert!(s.contains("/github/issues-pr/Shuozeli/protobuf-rs"));
+        assert!(s.contains("/github/license/Shuozeli/protobuf-rs"));
+        assert!(s.contains("badge/health-Active-brightgreen"));
+    }
+
+    #[test]
+    fn status_badges_use_owner_per_entry() {
+        // stonedb lives under github.com/stonedb/stonedb, not Shuozeli — verify
+        // we don't hardcode the owner across any of the six badge kinds.
+        let s = render_status_badges(&entry("stonedb", "stonedb", "Healthy", "green"));
+        assert!(s.contains("/github/actions/workflow/status/stonedb/stonedb/ci.yml"));
+        assert!(s.contains("/github/last-commit/stonedb/stonedb"));
+        assert!(s.contains("/github/issues/stonedb/stonedb"));
+        assert!(s.contains("/github/issues-pr/stonedb/stonedb"));
+        assert!(s.contains("/github/license/stonedb/stonedb"));
+    }
+
+    #[test]
+    fn status_badges_propagate_color_from_label() {
+        let dormant = render_status_badges(&entry("Shuozeli", "x", "Dormant", "lightgrey"));
+        assert!(dormant.contains("badge/health-Dormant-lightgrey"));
+    }
+
+    #[test]
+    fn status_badges_render_left_to_right_health_first() {
+        // The order is load-bearing for visual scanning: CI is the
+        // most important at-a-glance signal, then activity recency,
+        // then backlog (issues then PRs), then license, then the
+        // pidx-derived health roll-up. This test pins that order so
+        // a reorder is a deliberate choice rather than a drive-by.
+        let s = render_status_badges(&entry("Shuozeli", "x", "Active", "brightgreen"));
+        let ci_idx = s.find("/actions/workflow/status/").unwrap();
+        let last_idx = s.find("/last-commit/").unwrap();
+        let issues_idx = s.find("/issues/Shuozeli/x").unwrap();
+        let prs_idx = s.find("/issues-pr/").unwrap();
+        let license_idx = s.find("/license/").unwrap();
+        let health_idx = s.find("badge/health-").unwrap();
+        assert!(ci_idx < last_idx);
+        assert!(last_idx < issues_idx);
+        assert!(issues_idx < prs_idx);
+        assert!(prs_idx < license_idx);
+        assert!(license_idx < health_idx);
+    }
 }
