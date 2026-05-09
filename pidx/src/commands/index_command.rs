@@ -101,25 +101,37 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
             .unwrap_or(cat.as_str());
 
         out.push_str(&format!("### {title}\n\n"));
-        out.push_str("| Project | Language | Description | Status |\n");
-        out.push_str("|---------|----------|-------------|--------|\n");
+        out.push_str("| Project | Language | Description |\n");
+        out.push_str("|---------|----------|-------------|\n");
 
         if let Some(entries) = by_category.get(cat) {
             for entry in entries {
                 out.push_str(&format!(
-                    "| [{}](https://github.com/{}/{}) | {} | {} | {} |\n",
-                    entry.name,
-                    entry.owner,
-                    entry.name,
-                    entry.language,
-                    entry.description,
-                    render_status_badges(entry),
+                    "| [{}](https://github.com/{}/{}) | {} | {} |\n",
+                    entry.name, entry.owner, entry.name, entry.language, entry.description,
                 ));
             }
         }
 
         out.push('\n');
     }
+
+    // Status dashboard — one row per repo, one column per signal.
+    // Kept separate from the project list so the descriptions stay
+    // readable and the at-a-glance health view is in one scannable
+    // table. Repos appear in the same order as the project list (config
+    // order grouped by category) so the two sections read as parallel.
+    out.push_str("## Status Dashboard\n\n");
+    out.push_str("| Project | CI | Last commit | Issues | PRs | License | Health |\n");
+    out.push_str("|---------|----|-------------|--------|-----|---------|--------|\n");
+    for cat in &category_order {
+        if let Some(entries) = by_category.get(cat) {
+            for entry in entries {
+                out.push_str(&render_dashboard_row(entry));
+            }
+        }
+    }
+    out.push('\n');
 
     fs::write(&index_path, &out)?;
     println!("Updated index at {}", index_path.display());
@@ -138,42 +150,46 @@ struct RepoIndexEntry {
     health_score: f64,
 }
 
-/// Render the inline shields.io badges for a repo's Status cell.
+/// Render one row of the Status Dashboard table.
 ///
-/// Six badges, all flat-square, ordered for left-to-right scanning
-/// (health-first, then activity, then backlog, then metadata):
-///   1. CI workflow status (always points at `ci.yml`)
-///   2. Last commit (activity recency — surfaces stale repos)
-///   3. Open issue count
-///   4. Open PR count
-///   5. License (quick legal scan)
-///   6. Health label, colored by `HealthLabel::shield_color()`
-fn render_status_badges(e: &RepoIndexEntry) -> String {
+/// Seven columns: the project link, then six shields.io badges (all
+/// flat-square, no inline `label=` text — the column header carries
+/// the name so the badge can show only its value). Order matches the
+/// table header in `run`:
+///   1. Project (linked)
+///   2. CI workflow status (always points at `ci.yml`)
+///   3. Last commit (activity recency — surfaces stale repos)
+///   4. Open issue count
+///   5. Open PR count
+///   6. License (quick legal scan)
+///   7. Health label, colored by `HealthLabel::shield_color()`
+fn render_dashboard_row(e: &RepoIndexEntry) -> String {
+    let project = format!("[{}](https://github.com/{}/{})", e.name, e.owner, e.name);
     let ci = format!(
-        "![CI](https://img.shields.io/github/actions/workflow/status/{}/{}/ci.yml?branch=main&style=flat-square&label=CI)",
+        "![CI](https://img.shields.io/github/actions/workflow/status/{}/{}/ci.yml?branch=main&style=flat-square&label=)",
         e.owner, e.name,
     );
     let last_commit = format!(
-        "![Last commit](https://img.shields.io/github/last-commit/{}/{}?style=flat-square&label=last)",
+        "![Last commit](https://img.shields.io/github/last-commit/{}/{}?style=flat-square&label=)",
         e.owner, e.name,
     );
     let issues = format!(
-        "![Issues](https://img.shields.io/github/issues/{}/{}?style=flat-square&label=issues)",
+        "![Issues](https://img.shields.io/github/issues/{}/{}?style=flat-square&label=)",
         e.owner, e.name,
     );
     let prs = format!(
-        "![PRs](https://img.shields.io/github/issues-pr/{}/{}?style=flat-square&label=PRs)",
+        "![PRs](https://img.shields.io/github/issues-pr/{}/{}?style=flat-square&label=)",
         e.owner, e.name,
     );
     let license = format!(
-        "![License](https://img.shields.io/github/license/{}/{}?style=flat-square)",
+        "![License](https://img.shields.io/github/license/{}/{}?style=flat-square&label=)",
         e.owner, e.name,
     );
     let health = format!(
-        "![Health](https://img.shields.io/badge/health-{}-{}?style=flat-square)",
+        "![Health](https://img.shields.io/badge/{}-{}?style=flat-square)",
         e.health_label, e.health_color,
     );
-    format!("{ci} {last_commit} {issues} {prs} {license} {health}")
+    format!("| {project} | {ci} | {last_commit} | {issues} | {prs} | {license} | {health} |\n")
 }
 
 #[cfg(test)]
@@ -193,52 +209,66 @@ mod tests {
     }
 
     #[test]
-    fn status_badges_emits_all_six_badge_kinds() {
+    fn dashboard_row_emits_seven_pipe_separated_cells() {
         // Arrange / Act
-        let s = render_status_badges(&entry("Shuozeli", "protobuf-rs", "Active", "brightgreen"));
+        let row = render_dashboard_row(&entry("Shuozeli", "protobuf-rs", "Active", "brightgreen"));
 
-        // Assert: every badge URL we promised is present, in any order
-        // the formatter produces.
-        assert!(s.contains("/github/actions/workflow/status/Shuozeli/protobuf-rs/ci.yml"));
-        assert!(s.contains("/github/last-commit/Shuozeli/protobuf-rs"));
-        assert!(s.contains("/github/issues/Shuozeli/protobuf-rs"));
-        assert!(s.contains("/github/issues-pr/Shuozeli/protobuf-rs"));
-        assert!(s.contains("/github/license/Shuozeli/protobuf-rs"));
-        assert!(s.contains("badge/health-Active-brightgreen"));
+        // Assert: 7 cells (project + 6 badges) means 8 pipes plus the
+        // trailing newline. Locking the cell count keeps a future
+        // contributor from silently widening the dashboard table
+        // without updating the header.
+        let cell_count = row.matches('|').count();
+        assert_eq!(cell_count, 8, "expected 7 cells (8 pipes), got row: {row}");
+        assert!(row.ends_with('\n'));
     }
 
     #[test]
-    fn status_badges_use_owner_per_entry() {
+    fn dashboard_row_includes_all_six_badge_kinds() {
+        // Arrange / Act
+        let row = render_dashboard_row(&entry("Shuozeli", "protobuf-rs", "Active", "brightgreen"));
+
+        // Assert: every badge URL fragment is present.
+        assert!(row.contains("/github/actions/workflow/status/Shuozeli/protobuf-rs/ci.yml"));
+        assert!(row.contains("/github/last-commit/Shuozeli/protobuf-rs"));
+        assert!(row.contains("/github/issues/Shuozeli/protobuf-rs"));
+        assert!(row.contains("/github/issues-pr/Shuozeli/protobuf-rs"));
+        assert!(row.contains("/github/license/Shuozeli/protobuf-rs"));
+        assert!(row.contains("/badge/Active-brightgreen"));
+    }
+
+    #[test]
+    fn dashboard_row_uses_owner_per_entry() {
         // stonedb lives under github.com/stonedb/stonedb, not Shuozeli — verify
-        // we don't hardcode the owner across any of the six badge kinds.
-        let s = render_status_badges(&entry("stonedb", "stonedb", "Healthy", "green"));
-        assert!(s.contains("/github/actions/workflow/status/stonedb/stonedb/ci.yml"));
-        assert!(s.contains("/github/last-commit/stonedb/stonedb"));
-        assert!(s.contains("/github/issues/stonedb/stonedb"));
-        assert!(s.contains("/github/issues-pr/stonedb/stonedb"));
-        assert!(s.contains("/github/license/stonedb/stonedb"));
+        // we don't hardcode the owner across any of the six badge kinds
+        // OR the project link.
+        let row = render_dashboard_row(&entry("stonedb", "stonedb", "Healthy", "green"));
+        assert!(row.contains("[stonedb](https://github.com/stonedb/stonedb)"));
+        assert!(row.contains("/github/actions/workflow/status/stonedb/stonedb/ci.yml"));
+        assert!(row.contains("/github/last-commit/stonedb/stonedb"));
+        assert!(row.contains("/github/issues/stonedb/stonedb"));
+        assert!(row.contains("/github/issues-pr/stonedb/stonedb"));
+        assert!(row.contains("/github/license/stonedb/stonedb"));
     }
 
     #[test]
-    fn status_badges_propagate_color_from_label() {
-        let dormant = render_status_badges(&entry("Shuozeli", "x", "Dormant", "lightgrey"));
-        assert!(dormant.contains("badge/health-Dormant-lightgrey"));
+    fn dashboard_row_propagates_color_from_label() {
+        let dormant = render_dashboard_row(&entry("Shuozeli", "x", "Dormant", "lightgrey"));
+        assert!(dormant.contains("/badge/Dormant-lightgrey"));
     }
 
     #[test]
-    fn status_badges_render_left_to_right_health_first() {
-        // The order is load-bearing for visual scanning: CI is the
-        // most important at-a-glance signal, then activity recency,
-        // then backlog (issues then PRs), then license, then the
-        // pidx-derived health roll-up. This test pins that order so
-        // a reorder is a deliberate choice rather than a drive-by.
-        let s = render_status_badges(&entry("Shuozeli", "x", "Active", "brightgreen"));
-        let ci_idx = s.find("/actions/workflow/status/").unwrap();
-        let last_idx = s.find("/last-commit/").unwrap();
-        let issues_idx = s.find("/issues/Shuozeli/x").unwrap();
-        let prs_idx = s.find("/issues-pr/").unwrap();
-        let license_idx = s.find("/license/").unwrap();
-        let health_idx = s.find("badge/health-").unwrap();
+    fn dashboard_row_orders_columns_left_to_right_for_visual_scanning() {
+        // Order: project | CI | last commit | issues | PRs | license | health.
+        // Pin so a future drive-by reorder is a deliberate choice.
+        let row = render_dashboard_row(&entry("Shuozeli", "x", "Active", "brightgreen"));
+        let project_idx = row.find("[x](https://github.com/Shuozeli/x)").unwrap();
+        let ci_idx = row.find("/actions/workflow/status/").unwrap();
+        let last_idx = row.find("/last-commit/").unwrap();
+        let issues_idx = row.find("/issues/Shuozeli/x").unwrap();
+        let prs_idx = row.find("/issues-pr/").unwrap();
+        let license_idx = row.find("/license/").unwrap();
+        let health_idx = row.find("/badge/Active-").unwrap();
+        assert!(project_idx < ci_idx);
         assert!(ci_idx < last_idx);
         assert!(last_idx < issues_idx);
         assert!(issues_idx < prs_idx);
