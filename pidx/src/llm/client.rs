@@ -8,9 +8,33 @@ use crate::config::LlmConfig;
 use super::error::LlmError;
 use super::types::{
     Classification, ClassifyRequest, CommitCategory, CommitImpact,
-    ReduceArchitectureRequest, ReduceChangelogRequest, ReduceDescriptionRequest,
+    ReduceArchitectureRequest, ReduceChangelogRequest,
+    ReduceChangelogWeekClassification, ReduceDescriptionRequest,
 };
 use super::{LlmClient, LlmFuture};
+
+/// System prompt for `reduce_changelog`. Bumping any text here MUST
+/// be paired with a bump of
+/// [`crate::llm::REDUCE_CHANGELOG_PROMPT_VERSION`] — otherwise the
+/// `doc_reducer_outputs` cache would serve stale prose under the new
+/// prompt.
+const REDUCE_CHANGELOG_SYSTEM_PROMPT: &str = r#"You compose Keep-a-Changelog markdown fragments from a list of pre-classified git commits for a single ISO week.
+
+Output rules — follow EXACTLY:
+
+1. Emit ONE level-3 header `### Week of YYYY-MM-DD` using the Monday date provided in the user message.
+2. Under it, emit at most four level-4 sections in this fixed order:
+     #### Added
+     #### Changed
+     #### Fixed
+     #### Removed
+3. Inside each section, emit one bullet per CLASSIFICATION ENTRY, NOT per commit. You MAY merge two near-duplicate entries (e.g. two commits both about "fix replay races") into one bullet.
+4. Bullets are present-tense imperative, max 100 characters, no trailing period, no commit SHAs in the bullet text.
+5. If a section has no entries, OMIT the heading entirely (do not write `#### Removed` with nothing under it).
+6. Skip the `[Internal]` entries — they are context only and MUST NOT appear in the output. If, after dropping Internal, there are no entries at all in any section, output ONLY the `### Week of YYYY-MM-DD` header followed by the line `_no user-visible changes_`.
+7. Do NOT invent content. Every bullet must trace back to one or more provided summaries.
+8. Reply with ONLY the markdown — no code fences, no preamble, no commentary.
+"#;
 
 /// System prompt for `classify_commit`. Bumping any text here MUST be
 /// paired with a bump of [`crate::llm::CLASSIFY_PROMPT_VERSION`] —
@@ -45,6 +69,7 @@ pub struct AnthropicCompatibleClient {
     api_key: String,
     model: String,
     classify_max_tokens: u32,
+    reduce_max_tokens: u32,
     /// Provider key from config (e.g. "minimax"). Used for telemetry
     /// and for the `llm_provider` cache column.
     provider: String,
@@ -73,6 +98,7 @@ impl AnthropicCompatibleClient {
             api_key,
             model: config.model.clone(),
             classify_max_tokens: config.classify_max_tokens,
+            reduce_max_tokens: config.reduce_max_tokens,
             provider: config.provider.clone(),
             http,
         })
@@ -131,6 +157,22 @@ pub(crate) fn strip_json_fences(s: &str) -> &str {
     }
 }
 
+/// Strip ```markdown ...``` or bare ``` fences from a model reply.
+/// The reducer prompt explicitly forbids fences but defending against
+/// a model that ignores instructions is cheaper than re-running.
+pub(crate) fn strip_markdown_fences(s: &str) -> &str {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("```markdown") {
+        rest.trim_start().trim_end_matches("```").trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```md") {
+        rest.trim_start().trim_end_matches("```").trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest.trim_start().trim_end_matches("```").trim()
+    } else {
+        trimmed
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ClassificationWire {
     category: CommitCategory,
@@ -163,100 +205,202 @@ fn messages_url(base_url: &str) -> String {
     format!("{trimmed}/v1/messages")
 }
 
+/// First seven characters of a git SHA (or the whole thing if shorter).
+fn short_sha(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
+}
+
+/// Render the user message body for `reduce_changelog`. Pulled out so
+/// tests can pin the wire format without spinning up an HTTP client.
+///
+/// Bullets are grouped by category; `Internal` is included as context
+/// (the design doc requires it for the LLM's reasoning) but the
+/// system prompt instructs the model to omit it from the rendered
+/// markdown.
+pub(crate) fn render_reduce_changelog_prompt(
+    req: &super::types::ReduceChangelogRequest,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Repo: {}", req.repo_name);
+    let _ = writeln!(
+        out,
+        "Week: {} ({} .. {})",
+        req.week_label, req.week_start, req.week_end
+    );
+    let _ = writeln!(out, "Monday date for the `### Week of` header: {}", req.week_start);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Commits (already classified by category):");
+    let _ = writeln!(out);
+
+    for cat in [
+        CommitCategory::Added,
+        CommitCategory::Changed,
+        CommitCategory::Fixed,
+        CommitCategory::Removed,
+        CommitCategory::Internal,
+    ] {
+        let label = match cat {
+            CommitCategory::Added => "Added",
+            CommitCategory::Changed => "Changed",
+            CommitCategory::Fixed => "Fixed",
+            CommitCategory::Removed => "Removed",
+            CommitCategory::Internal => "Internal",
+        };
+        let entries: Vec<&super::types::ReduceChangelogWeekClassification> = req
+            .classifications
+            .iter()
+            .filter(|c| c.category == cat)
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "[{label}]");
+        for e in entries {
+            let _ = writeln!(out, "- {} {}", short_sha(&e.sha), e.summary);
+        }
+        let _ = writeln!(out);
+    }
+
+    out
+}
+
+impl AnthropicCompatibleClient {
+    /// Shared `POST /v1/messages` helper. Handles the wire envelope,
+    /// status mapping (200/401/403/429/other), and the "no text block"
+    /// edge case that MiniMax-M2 hits when `max_tokens` is too low for
+    /// its thinking budget.
+    ///
+    /// `purpose` names the operation in the "no text block" error
+    /// message so operators know which `*_max_tokens` knob to bump.
+    async fn call_messages(
+        &self,
+        system: &str,
+        user_content: &str,
+        max_tokens: u32,
+        purpose: &str,
+        max_tokens_knob: &str,
+    ) -> Result<String, LlmError> {
+        let url = messages_url(&self.base_url);
+
+        let body = json!({
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [
+                {"role": "user", "content": user_content}
+            ]
+        });
+
+        let response = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(LlmError::Http)?;
+
+        let status = response.status();
+        match status.as_u16() {
+            200 => {}
+            401 | 403 => {
+                let text = response.text().await.unwrap_or_default();
+                return Err(LlmError::Auth(format!(
+                    "{status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            429 => {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                return Err(LlmError::RateLimit { retry_after });
+            }
+            _ => {
+                let text = response.text().await.unwrap_or_default();
+                return Err(LlmError::Other(anyhow::anyhow!(
+                    "unexpected HTTP {status} from {url}: {}",
+                    text.chars().take(500).collect::<String>()
+                )));
+            }
+        }
+
+        let wire: AnthropicMessagesResponse =
+            response.json().await.map_err(LlmError::Http)?;
+
+        let text = wire
+            .content
+            .iter()
+            .find_map(|b| match b {
+                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                AnthropicContentBlock::Other => None,
+            })
+            .ok_or_else(|| {
+                LlmError::Other(anyhow::anyhow!(
+                    "{purpose} response had no text content block — \
+                     likely {max_tokens_knob}={max_tokens} is too low for \
+                     the model's reasoning budget. Try bumping \
+                     [llm].{max_tokens_knob} in pidx.toml.",
+                ))
+            })?;
+
+        Ok(text.to_string())
+    }
+}
+
 impl LlmClient for AnthropicCompatibleClient {
     fn classify_commit<'a>(
         &'a self,
         req: ClassifyRequest,
     ) -> LlmFuture<'a, Classification> {
         Box::pin(async move {
-            let url = messages_url(&self.base_url);
-
             let user_content = format!(
                 "Repository: {}\n\n{}",
                 req.repo_name, req.diff_excerpt
             );
-            let body = json!({
-                "model": self.model,
-                "max_tokens": self.classify_max_tokens,
-                "system": CLASSIFY_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": user_content}
-                ]
-            });
 
-            let response = self
-                .http
-                .post(&url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(LlmError::Http)?;
+            let text = self
+                .call_messages(
+                    CLASSIFY_SYSTEM_PROMPT,
+                    &user_content,
+                    self.classify_max_tokens,
+                    "classifier",
+                    "classify_max_tokens",
+                )
+                .await?;
 
-            let status = response.status();
-            match status.as_u16() {
-                200 => {}
-                401 | 403 => {
-                    let text = response.text().await.unwrap_or_default();
-                    return Err(LlmError::Auth(format!(
-                        "{status}: {}",
-                        text.chars().take(200).collect::<String>()
-                    )));
-                }
-                429 => {
-                    let retry_after = response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-                    return Err(LlmError::RateLimit { retry_after });
-                }
-                _ => {
-                    let text = response.text().await.unwrap_or_default();
-                    return Err(LlmError::Other(anyhow::anyhow!(
-                        "unexpected HTTP {status} from {url}: {}",
-                        text.chars().take(500).collect::<String>()
-                    )));
-                }
-            }
-
-            let wire: AnthropicMessagesResponse =
-                response.json().await.map_err(LlmError::Http)?;
-
-            let text = wire
-                .content
-                .iter()
-                .find_map(|b| match b {
-                    AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                    AnthropicContentBlock::Other => None,
-                })
-                .ok_or_else(|| {
-                    // MiniMax-M2 emits a `thinking` block before its
-                    // `text` block; if `max_tokens` is too low the
-                    // thinking can swallow the budget and no text is
-                    // emitted. Surface that hypothesis explicitly so
-                    // operators don't have to guess.
-                    LlmError::Other(anyhow::anyhow!(
-                        "classifier response had no text content block — \
-                         likely classify_max_tokens={} is too low for the \
-                         model's reasoning budget. Try bumping \
-                         [llm].classify_max_tokens in pidx.toml.",
-                        self.classify_max_tokens
-                    ))
-                })?;
-
-            parse_classification(text)
+            parse_classification(&text)
         })
     }
 
     fn reduce_changelog<'a>(
         &'a self,
-        _req: ReduceChangelogRequest,
+        req: ReduceChangelogRequest,
     ) -> LlmFuture<'a, String> {
-        Box::pin(async { Err(LlmError::NotImplemented) })
+        Box::pin(async move {
+            let user_content = render_reduce_changelog_prompt(&req);
+
+            let text = self
+                .call_messages(
+                    REDUCE_CHANGELOG_SYSTEM_PROMPT,
+                    &user_content,
+                    self.reduce_max_tokens,
+                    "reducer",
+                    "reduce_max_tokens",
+                )
+                .await?;
+
+            // The prompt asks for raw markdown; defensively strip
+            // any code fences the model might still wrap things in.
+            Ok(strip_markdown_fences(&text).to_string())
+        })
     }
 
     fn reduce_architecture<'a>(

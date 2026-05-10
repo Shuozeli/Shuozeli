@@ -78,6 +78,23 @@ pub fn get_all_repos(conn: &Connection) -> anyhow::Result<Vec<RepoRow>> {
     Ok(result)
 }
 
+/// Advance the `repos.last_processed_sha` cursor. Phase 2 calls this
+/// after a successful changelog render+write so subsequent runs only
+/// touch new commits. The atomicity matters: callers MUST NOT call
+/// this until the file write has succeeded.
+pub fn update_last_processed_sha(
+    conn: &Connection,
+    repo_id: i64,
+    sha: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE repos SET last_processed_sha = ?1 WHERE id = ?2",
+        params![sha, repo_id],
+    )
+    .context("Failed to update repos.last_processed_sha")?;
+    Ok(())
+}
+
 pub fn get_repo_by_name(
     conn: &Connection,
     owner: &str,

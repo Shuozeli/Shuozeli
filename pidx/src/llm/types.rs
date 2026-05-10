@@ -51,13 +51,32 @@ pub struct Classification {
     pub impact: CommitImpact,
 }
 
+/// One classification entry for the reducer's per-week input. Carries
+/// the short SHA so the prompt can list `<sha7> <summary>` per bullet
+/// and the LLM has a stable trace back to the source commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReduceChangelogWeekClassification {
+    pub sha: String,
+    pub category: CommitCategory,
+    pub summary: String,
+    pub impact: CommitImpact,
+}
+
 /// Inputs for the per-week (or per-tag) changelog reducer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReduceChangelogRequest {
     pub repo_name: String,
     /// e.g. `"week-2026-W18"` or `"v0.3.0"`.
     pub scope_key: String,
-    pub classifications: Vec<Classification>,
+    /// Human-readable date label for the week (e.g. `"2026-04-27"`,
+    /// the Monday of the ISO week). The reducer prompt embeds this in
+    /// the `### Week of <date>` heading it emits.
+    pub week_label: String,
+    /// ISO date for the Monday that starts this week (YYYY-MM-DD).
+    pub week_start: String,
+    /// ISO date for the Sunday that ends this week (YYYY-MM-DD).
+    pub week_end: String,
+    pub classifications: Vec<ReduceChangelogWeekClassification>,
     pub prompt_version: u32,
 }
 

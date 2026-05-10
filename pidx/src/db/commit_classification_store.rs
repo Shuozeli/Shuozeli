@@ -66,6 +66,67 @@ fn parse_impact(s: &str) -> anyhow::Result<CommitImpact> {
     }
 }
 
+/// One row paired with its commit's authored timestamp + sha. Used by
+/// the Phase 2 reducer to bucket classifications by ISO week without
+/// needing a second round-trip to `commits`.
+#[derive(Debug, Clone)]
+pub struct ClassificationWithCommit {
+    pub sha: String,
+    /// Commit `committed_at` from the `commits` table (ISO 8601 string
+    /// as stored — "YYYY-MM-DDTHH:MM:SSZ" in practice).
+    pub committed_at: String,
+    pub category: CommitCategory,
+    pub summary: String,
+    pub impact: CommitImpact,
+}
+
+/// Return every cached classification for `repo_id` at the given prompt
+/// version, joined with the matching `commits` row so callers get the
+/// commit timestamp for free. Ordered by `committed_at` ascending so
+/// downstream weekly bucketing produces stable order.
+pub fn get_classifications_for_repo(
+    conn: &Connection,
+    repo_id: i64,
+    prompt_version: u32,
+) -> anyhow::Result<Vec<ClassificationWithCommit>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT cc.sha, c.committed_at, cc.category, cc.summary, cc.impact
+             FROM commit_classifications cc
+             INNER JOIN commits c
+               ON c.repo_id = cc.repo_id AND c.sha = cc.sha
+             WHERE cc.repo_id = ?1 AND cc.prompt_version = ?2
+             ORDER BY c.committed_at ASC, cc.sha ASC",
+        )
+        .context("Failed to prepare classifications-for-repo query")?;
+
+    let rows = stmt
+        .query_map(params![repo_id, prompt_version], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .context("Failed to query classifications-for-repo")?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (sha, ts, cat, summary, impact) =
+            row.context("Failed to read classifications-for-repo row")?;
+        out.push(ClassificationWithCommit {
+            sha,
+            committed_at: ts,
+            category: parse_category(&cat)?,
+            summary,
+            impact: parse_impact(&impact)?,
+        });
+    }
+    Ok(out)
+}
+
 /// Look up a cached classification. Returns `Ok(None)` for cache miss.
 pub fn get_classification(
     conn: &Connection,

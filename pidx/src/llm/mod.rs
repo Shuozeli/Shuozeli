@@ -19,7 +19,8 @@ pub use enrich::{EnrichError, EnrichedCommit, FileDiff, enrich_commit, render_fo
 pub use error::LlmError;
 pub use types::{
     Classification, ClassifyRequest, CommitCategory, CommitImpact,
-    ReduceArchitectureRequest, ReduceChangelogRequest, ReduceDescriptionRequest,
+    ReduceArchitectureRequest, ReduceChangelogRequest,
+    ReduceChangelogWeekClassification, ReduceDescriptionRequest,
 };
 
 use std::future::Future;
@@ -34,6 +35,16 @@ use std::pin::Pin;
 /// cache will serve stale rows under the new prompt — which is exactly
 /// the bug this constant exists to prevent.
 pub const CLASSIFY_PROMPT_VERSION: u32 = 1;
+
+/// Version of the `reduce_changelog` system prompt + output format.
+///
+/// **Bump this whenever the reducer prompt text or expected markdown
+/// shape changes.** The `doc_reducer_outputs.input_hash` mixes this
+/// constant in alongside the sorted classification SHAs, so a bump
+/// invalidates every cached weekly fragment on the next run. Without
+/// the bump, the reducer would happily serve stale prose under the new
+/// prompt.
+pub const REDUCE_CHANGELOG_PROMPT_VERSION: u32 = 1;
 
 /// Result alias for trait methods. Boxed so the trait stays object-safe
 /// without depending on `async_trait` (we don't need dyn dispatch in

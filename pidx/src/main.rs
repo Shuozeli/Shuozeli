@@ -85,8 +85,19 @@ enum Commands {
         #[arg(long)]
         classify: bool,
 
+        /// Run the Phase 2 reduce pipeline: group cached
+        /// classifications by ISO week, ask the LLM to compose the
+        /// per-week Keep-a-Changelog fragment (cached in
+        /// `doc_reducer_outputs`), render the merged file, and write
+        /// `docs/<repo>/CHANGELOG.md`. Implies `--classify` so a
+        /// fresh-DB run does both phases in one command. Advances
+        /// `last_processed_sha` on success.
+        #[arg(long)]
+        reduce: bool,
+
         /// Bypass the cache and re-classify every commit. Still
-        /// respects `prompt_version` for INSERT OR REPLACE.
+        /// respects `prompt_version` for INSERT OR REPLACE. With
+        /// `--reduce`, also bypasses the reducer cache.
         #[arg(long)]
         force: bool,
     },
@@ -172,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::docs_command::ingest(&config, repo.as_deref())?;
             }
         },
-        Commands::Changelog { action, repo, dry_run, classify, force } => match action {
+        Commands::Changelog { action, repo, dry_run, classify, reduce, force } => match action {
             Some(ChangelogAction::Export { week, repo: subcmd_repo }) => {
                 commands::changelog_command::export(
                     &config,
@@ -186,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                     repo.as_deref(),
                     dry_run,
                     classify,
+                    reduce,
                     force,
                 )
                 .await?;

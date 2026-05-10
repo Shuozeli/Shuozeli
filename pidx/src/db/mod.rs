@@ -1,5 +1,6 @@
 pub mod commit_classification_store;
 pub mod commit_store;
+pub mod doc_reducer_output_store;
 pub mod issue_store;
 pub mod llm_summary_store;
 pub mod release_store;
