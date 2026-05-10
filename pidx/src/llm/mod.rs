@@ -1,22 +1,21 @@
 //! LLM client abstraction for the doc pipeline.
 //!
-//! Phase 0 ships only the trait, request/response shapes, and a
-//! provider-agnostic skeleton client. Every method returns
-//! [`LlmError::NotImplemented`] until Phase 1 wires the wire-format
-//! adapter.
+//! Phase 1 wires the classify path against MiniMax. Reducer methods
+//! still return [`LlmError::NotImplemented`] until Phase 2+.
 
-// The trait, request/response types, and error variants are wired in
-// Phase 1+. The skeleton is exported now so callers (changelog command,
+// Reducer types are re-exported now so callers (changelog command,
 // future fanout driver) can compile against the final shapes; the
 // `unused_imports` allow keeps the re-exports from warning until
-// Phase 1 wires them in.
+// reducers land.
 #![allow(dead_code, unused_imports)]
 
 mod client;
+pub mod enrich;
 mod error;
 mod types;
 
 pub use client::AnthropicCompatibleClient;
+pub use enrich::{EnrichError, EnrichedCommit, FileDiff, enrich_commit, render_for_prompt};
 pub use error::LlmError;
 pub use types::{
     Classification, ClassifyRequest, CommitCategory, CommitImpact,
@@ -25,6 +24,16 @@ pub use types::{
 
 use std::future::Future;
 use std::pin::Pin;
+
+/// Version of the `classify_commit` system prompt + JSON schema.
+///
+/// **Bump this whenever the prompt text or the response schema
+/// changes.** The `commit_classifications` cache is keyed on
+/// `(repo_id, sha, prompt_version)`, so a bump cleanly invalidates
+/// every existing row on the next run. Forgetting to bump means the
+/// cache will serve stale rows under the new prompt — which is exactly
+/// the bug this constant exists to prevent.
+pub const CLASSIFY_PROMPT_VERSION: u32 = 1;
 
 /// Result alias for trait methods. Boxed so the trait stays object-safe
 /// without depending on `async_trait` (we don't need dyn dispatch in

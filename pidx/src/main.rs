@@ -61,8 +61,9 @@ enum Commands {
 
     /// LLM doc pipeline — discover unprocessed commits and (eventually)
     /// regenerate per-repo CHANGELOG.md / architecture.md / description.
-    /// Phase 0: `--dry-run --repo <name>` only; subcommand `export`
-    /// retains the legacy structured-markdown export.
+    /// Phase 1: `--dry-run` (no LLM) or `--classify` (run map step,
+    /// cache results). Subcommand `export` retains the legacy
+    /// structured-markdown export.
     Changelog {
         #[command(subcommand)]
         action: Option<ChangelogAction>,
@@ -75,6 +76,19 @@ enum Commands {
         /// or write any files.
         #[arg(long)]
         dry_run: bool,
+
+        /// Run the Phase 1 map pipeline: enrich commits with diffs,
+        /// classify each via the LLM (parallel, cached), upsert
+        /// results into `commit_classifications`. Does NOT advance
+        /// `last_processed_sha` (Phase 2's job) and does NOT write
+        /// any docs (Phase 2+).
+        #[arg(long)]
+        classify: bool,
+
+        /// Bypass the cache and re-classify every commit. Still
+        /// respects `prompt_version` for INSERT OR REPLACE.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Display current config
@@ -158,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::docs_command::ingest(&config, repo.as_deref())?;
             }
         },
-        Commands::Changelog { action, repo, dry_run } => match action {
+        Commands::Changelog { action, repo, dry_run, classify, force } => match action {
             Some(ChangelogAction::Export { week, repo: subcmd_repo }) => {
                 commands::changelog_command::export(
                     &config,
@@ -167,7 +181,14 @@ async fn main() -> anyhow::Result<()> {
                 )?;
             }
             None => {
-                commands::changelog_command::run(&config, repo.as_deref(), dry_run)?;
+                commands::changelog_command::run(
+                    &config,
+                    repo.as_deref(),
+                    dry_run,
+                    classify,
+                    force,
+                )
+                .await?;
             }
         },
         Commands::Config { action } => match action {

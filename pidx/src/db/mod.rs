@@ -1,3 +1,4 @@
+pub mod commit_classification_store;
 pub mod commit_store;
 pub mod issue_store;
 pub mod llm_summary_store;
