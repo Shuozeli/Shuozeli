@@ -5,6 +5,7 @@ mod db;
 mod display;
 mod github;
 mod health;
+mod llm;
 
 use clap::{Parser, Subcommand};
 
@@ -58,10 +59,22 @@ enum Commands {
         action: DocsAction,
     },
 
-    /// Export weekly changelog data for agent consumption
+    /// LLM doc pipeline — discover unprocessed commits and (eventually)
+    /// regenerate per-repo CHANGELOG.md / architecture.md / description.
+    /// Phase 0: `--dry-run --repo <name>` only; subcommand `export`
+    /// retains the legacy structured-markdown export.
     Changelog {
         #[command(subcommand)]
-        action: ChangelogAction,
+        action: Option<ChangelogAction>,
+
+        /// Repo to operate on (matches `[[repos]] name` in pidx.toml).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Discover commits and print the plan; do not call any LLM
+        /// or write any files.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Display current config
@@ -145,9 +158,16 @@ async fn main() -> anyhow::Result<()> {
                 commands::docs_command::ingest(&config, repo.as_deref())?;
             }
         },
-        Commands::Changelog { action } => match action {
-            ChangelogAction::Export { week, repo } => {
-                commands::changelog_command::export(&config, week.as_deref(), repo.as_deref())?;
+        Commands::Changelog { action, repo, dry_run } => match action {
+            Some(ChangelogAction::Export { week, repo: subcmd_repo }) => {
+                commands::changelog_command::export(
+                    &config,
+                    week.as_deref(),
+                    subcmd_repo.as_deref(),
+                )?;
+            }
+            None => {
+                commands::changelog_command::run(&config, repo.as_deref(), dry_run)?;
             }
         },
         Commands::Config { action } => match action {

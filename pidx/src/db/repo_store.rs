@@ -12,6 +12,7 @@ pub struct RepoRow {
     pub pushed_at: Option<String>,
     pub synced_at: Option<String>,
     pub category: Option<String>,
+    pub last_processed_sha: Option<String>,
 }
 
 pub fn upsert_repo(
@@ -50,7 +51,7 @@ pub fn upsert_repo(
 
 pub fn get_all_repos(conn: &Connection) -> anyhow::Result<Vec<RepoRow>> {
     let mut stmt = conn
-        .prepare("SELECT id, owner, name, language, description, open_issues, pushed_at, synced_at, category FROM repos ORDER BY name")
+        .prepare("SELECT id, owner, name, language, description, open_issues, pushed_at, synced_at, category, last_processed_sha FROM repos ORDER BY name")
         .context("Failed to prepare repo query")?;
 
     let rows = stmt
@@ -65,6 +66,7 @@ pub fn get_all_repos(conn: &Connection) -> anyhow::Result<Vec<RepoRow>> {
                 pushed_at: row.get(6)?,
                 synced_at: row.get(7)?,
                 category: row.get(8)?,
+                last_processed_sha: row.get(9)?,
             })
         })
         .context("Failed to query repos")?;
@@ -82,7 +84,7 @@ pub fn get_repo_by_name(
     name: &str,
 ) -> anyhow::Result<Option<RepoRow>> {
     let mut stmt = conn
-        .prepare("SELECT id, owner, name, language, description, open_issues, pushed_at, synced_at, category FROM repos WHERE owner = ?1 AND name = ?2")
+        .prepare("SELECT id, owner, name, language, description, open_issues, pushed_at, synced_at, category, last_processed_sha FROM repos WHERE owner = ?1 AND name = ?2")
         .context("Failed to prepare repo query")?;
 
     let mut rows = stmt
@@ -97,6 +99,7 @@ pub fn get_repo_by_name(
                 pushed_at: row.get(6)?,
                 synced_at: row.get(7)?,
                 category: row.get(8)?,
+                last_processed_sha: row.get(9)?,
             })
         })
         .context("Failed to query repo")?;

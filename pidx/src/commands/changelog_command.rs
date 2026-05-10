@@ -10,6 +10,73 @@ use crate::db::issue_store;
 use crate::db::release_store;
 use crate::db::repo_store;
 
+/// Phase 0 entry point: discover unprocessed commits in
+/// `(repos.last_processed_sha, HEAD]` and print the plan. No LLM
+/// calls, no doc writes. Requires `--dry-run` (the only mode
+/// available in Phase 0) and `--repo <name>` (`--all` lands in
+/// Phase 5).
+pub fn run(
+    config: &Config,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if !dry_run {
+        bail!(
+            "pidx changelog currently only supports --dry-run (Phase 0). \
+             Real LLM-backed runs land in Phase 1+."
+        );
+    }
+    let repo_name = repo_filter.context(
+        "pidx changelog requires --repo <name> in Phase 0; --all lands in Phase 5",
+    )?;
+
+    // Fail fast if the [llm] config block is missing — even though
+    // Phase 0 doesn't call the LLM, the Phase 0 command refuses to
+    // pretend the pipeline is configured when it isn't.
+    let _llm_config = config.llm.as_ref().context(
+        "missing [llm] section in pidx.toml — pidx changelog needs an \
+         LLM provider configured. See docs/llm-doc-pipeline.md.",
+    )?;
+
+    let db = Database::open(&config.db_path())?;
+
+    let repo = db
+        .tx(|conn| repo_store::get_repo_by_name(conn, &config.owner, repo_name))?
+        .with_context(|| {
+            format!(
+                "repo '{repo_name}' not found in database for owner '{}'. \
+                 Has `pidx sync --repo {repo_name}` been run?",
+                config.owner
+            )
+        })?;
+
+    let last_sha = repo.last_processed_sha.as_deref();
+    let unprocessed = db.tx(|conn| {
+        commit_store::get_commits_after_sha(conn, repo.id, last_sha)
+    })?;
+
+    println!("pidx changelog --dry-run --repo {repo_name}");
+    println!("Repo: {repo_name}");
+    println!(
+        "Last processed SHA: {}",
+        last_sha.unwrap_or("(none)")
+    );
+    println!("Unprocessed commits: {}", unprocessed.len());
+
+    if let (Some(first), Some(last)) = (unprocessed.first(), unprocessed.last()) {
+        let first_subject = first.message.lines().next().unwrap_or("");
+        let last_subject = last.message.lines().next().unwrap_or("");
+        println!("First: {} {}", short_sha(&first.sha), first_subject);
+        println!("Last:  {} {}", short_sha(&last.sha), last_subject);
+    }
+
+    Ok(())
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
+}
+
 /// Parse an ISO week string like "2026-W12" into (monday_date, sunday_date).
 fn parse_iso_week(week_str: &str) -> anyhow::Result<(NaiveDate, NaiveDate)> {
     let parts: Vec<&str> = week_str.split("-W").collect();

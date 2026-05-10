@@ -1,3 +1,7 @@
+/// Initial table layout (version 0 → 1). Uses `IF NOT EXISTS` so it is safe
+/// to run on a fresh database; for an existing database that pre-dates the
+/// `user_version` migration scheme we ran this batch before bumping the
+/// version, so re-running is a no-op.
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS repos (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,3 +70,40 @@ CREATE TABLE IF NOT EXISTS sync_events (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 "#;
+
+/// LLM doc pipeline (Phase 0): per-commit classification cache,
+/// per-repo per-kind reducer output cache, and the
+/// `repos.last_processed_sha` cursor used by `pidx changelog`.
+pub const MIGRATION_V2_LLM_DOC_PIPELINE: &str = r#"
+CREATE TABLE IF NOT EXISTS commit_classifications (
+    repo_id          INTEGER NOT NULL,
+    sha              TEXT    NOT NULL,
+    prompt_version   INTEGER NOT NULL,
+    category         TEXT    NOT NULL,
+    summary          TEXT    NOT NULL,
+    impact           TEXT    NOT NULL,
+    llm_provider     TEXT    NOT NULL,
+    llm_model        TEXT    NOT NULL,
+    classified_at    INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, sha, prompt_version),
+    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS doc_reducer_outputs (
+    repo_id          INTEGER NOT NULL,
+    kind             TEXT    NOT NULL,
+    scope_key        TEXT    NOT NULL,
+    input_hash       TEXT    NOT NULL,
+    output           TEXT    NOT NULL,
+    llm_provider     TEXT    NOT NULL,
+    llm_model        TEXT    NOT NULL,
+    rendered_at      INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, kind, scope_key),
+    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+);
+"#;
+
+/// `ALTER TABLE` step for v2. Kept separate because `ADD COLUMN` is not
+/// idempotent in SQLite and the migration runner gates it on `user_version`.
+pub const MIGRATION_V2_ADD_LAST_PROCESSED_SHA: &str =
+    "ALTER TABLE repos ADD COLUMN last_processed_sha TEXT;";

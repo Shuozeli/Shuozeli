@@ -30,9 +30,41 @@ impl Database {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
+        // Versioned migrations gated on PRAGMA user_version. Each step is
+        // idempotent against a clean DB (CREATE IF NOT EXISTS) but the
+        // version gate is what makes ALTER-style steps safe to re-run.
+        let current: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("Failed to read user_version")?;
+
+        // v0 → v1: initial schema. We always run this batch (it's
+        // IF NOT EXISTS) so legacy databases that pre-date the migration
+        // scheme get caught up before further steps run.
         self.conn
             .execute_batch(schema::CREATE_TABLES)
-            .context("Failed to run migrations")?;
+            .context("Failed to apply v1 (initial schema)")?;
+        if current < 1 {
+            self.conn
+                .execute_batch("PRAGMA user_version = 1;")
+                .context("Failed to bump user_version to 1")?;
+        }
+
+        // v1 → v2: LLM doc pipeline tables + repos.last_processed_sha.
+        if current < 2 {
+            self.conn
+                .execute_batch(schema::MIGRATION_V2_LLM_DOC_PIPELINE)
+                .context("Failed to apply v2 (LLM doc pipeline tables)")?;
+            // ADD COLUMN is not IF NOT EXISTS — the version gate above
+            // guarantees we only attempt it once per database.
+            self.conn
+                .execute_batch(schema::MIGRATION_V2_ADD_LAST_PROCESSED_SHA)
+                .context("Failed to apply v2 (repos.last_processed_sha)")?;
+            self.conn
+                .execute_batch("PRAGMA user_version = 2;")
+                .context("Failed to bump user_version to 2")?;
+        }
+
         Ok(())
     }
 

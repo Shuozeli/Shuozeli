@@ -6,6 +6,24 @@ github_token_env = "GITHUB_TOKEN"
 commits_per_sync = 100
 db_path = "~/.pidx/pidx.db"
 
+# LLM doc pipeline (optional in v1; required for `pidx changelog`).
+# See docs/llm-doc-pipeline.md for the full design.
+[llm]
+provider = "minimax"          # minimax | doubao | anthropic
+model = "MiniMax-M2"
+api_key_env = "MINIMAX_API_KEY"
+base_url = "https://api.minimax.chat/anthropic"
+max_concurrent_requests = 8
+classify_max_tokens = 400
+reduce_max_tokens = 2000
+
+[llm.classify]
+diff_lines_per_file = 40
+
+[llm.budget]
+daily_token_limit = 5_000_000
+warn_at_pct = 80
+
 [[categories]]
 key = "serialization"
 title = "Serialization & Schema Tools"
