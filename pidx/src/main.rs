@@ -95,9 +95,21 @@ enum Commands {
         #[arg(long)]
         reduce: bool,
 
+        /// Run the Phase 3 architecture reducer ONLY: read existing
+        /// cached classifications + a fresh directory snapshot of the
+        /// submodule, ask the LLM to compose `architecture.md` (cached
+        /// in `doc_reducer_outputs` as `kind=architecture`,
+        /// `scope_key=all`), and write
+        /// `docs/<repo>/architecture.md`. Does NOT classify and does
+        /// NOT advance `last_processed_sha`; fails clearly if there
+        /// are no cached classifications.
+        #[arg(long = "reduce-arch")]
+        reduce_arch: bool,
+
         /// Bypass the cache and re-classify every commit. Still
         /// respects `prompt_version` for INSERT OR REPLACE. With
-        /// `--reduce`, also bypasses the reducer cache.
+        /// `--reduce` or `--reduce-arch`, also bypasses the reducer
+        /// cache.
         #[arg(long)]
         force: bool,
     },
@@ -183,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::docs_command::ingest(&config, repo.as_deref())?;
             }
         },
-        Commands::Changelog { action, repo, dry_run, classify, reduce, force } => match action {
+        Commands::Changelog { action, repo, dry_run, classify, reduce, reduce_arch, force } => match action {
             Some(ChangelogAction::Export { week, repo: subcmd_repo }) => {
                 commands::changelog_command::export(
                     &config,
@@ -198,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
                     dry_run,
                     classify,
                     reduce,
+                    reduce_arch,
                     force,
                 )
                 .await?;

@@ -18,15 +18,17 @@ use crate::db::issue_store;
 use crate::db::release_store;
 use crate::db::repo_store::{self, RepoRow};
 use crate::llm::{
-    AnthropicCompatibleClient, CLASSIFY_PROMPT_VERSION, ClassifyRequest, CommitCategory,
-    LlmClient, LlmError, REDUCE_CHANGELOG_PROMPT_VERSION, ReduceChangelogRequest,
-    ReduceChangelogWeekClassification, render_for_prompt,
+    ARCHITECTURE_CLASSIFICATION_LIMIT, AnthropicCompatibleClient, ArchitectureClassificationContext,
+    CLASSIFY_PROMPT_VERSION, ClassifyRequest, CommitCategory, LlmClient, LlmError,
+    REDUCE_ARCHITECTURE_PROMPT_VERSION, REDUCE_CHANGELOG_PROMPT_VERSION,
+    ReduceArchitectureRequest, ReduceChangelogRequest, ReduceChangelogWeekClassification,
+    RepoSnapshot, render_for_prompt,
 };
 
-/// `pidx changelog --repo <name>` entry point. Three modes:
+/// `pidx changelog --repo <name>` entry point. Modes:
 ///
-/// - `--dry-run` (no `--reduce`): discover unprocessed commits, print
-///   the plan, no LLM calls, no DB writes.
+/// - `--dry-run` (no `--reduce`/`--reduce-arch`): discover unprocessed
+///   commits, print the plan, no LLM calls, no DB writes.
 /// - `--classify` (optionally `--force`): Phase 1 map pipeline —
 ///   discover, enrich, classify (parallel, cached), upsert results.
 ///   Does **not** advance `last_processed_sha` (Phase 2's job).
@@ -37,33 +39,42 @@ use crate::llm::{
 ///   `doc_reducer_outputs`), renders the merged file, writes
 ///   `docs/<repo>/CHANGELOG.md`, and advances `last_processed_sha` on
 ///   success. With `--dry-run --reduce`: skips file write and SHA bump.
+/// - `--reduce-arch` (Phase 3): runs ONLY the architecture reducer
+///   against existing cached classifications + a fresh directory
+///   snapshot. Does NOT classify, does NOT advance the changelog
+///   cursor, fails clearly if `commit_classifications` is empty for
+///   the repo. Writes `docs/<repo>/architecture.md`.
 ///
 /// Calling none of the flags is an error: callers must opt in
 /// explicitly so nobody accidentally hits the LLM API.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: &Config,
     repo_filter: Option<&str>,
     dry_run: bool,
     classify: bool,
     reduce: bool,
+    reduce_arch: bool,
     force: bool,
 ) -> anyhow::Result<()> {
     // --reduce implies --classify (so a fresh-DB run does both phases
     // in one command). Validate the remaining combinations explicitly
     // so a typo doesn't silently fall through to "do nothing".
     let effective_classify = classify || reduce;
+    let any_reduce = reduce || reduce_arch;
+    let any_action = effective_classify || reduce_arch;
 
-    if dry_run && classify && !reduce {
+    if dry_run && classify && !any_reduce {
         bail!("--dry-run and --classify are mutually exclusive (use --dry-run --reduce to plan a Phase 2 run)");
     }
-    if !dry_run && !effective_classify {
+    if !dry_run && !any_action {
         bail!(
-            "pidx changelog requires --dry-run, --classify, or --reduce. \
+            "pidx changelog requires --dry-run, --classify, --reduce, or --reduce-arch. \
              See `pidx changelog --help` for the phase semantics."
         );
     }
-    if force && !effective_classify {
-        bail!("--force is only meaningful with --classify or --reduce");
+    if force && !any_action {
+        bail!("--force is only meaningful with --classify, --reduce, or --reduce-arch");
     }
 
     let repo_name = repo_filter.context(
@@ -92,9 +103,19 @@ pub async fn run(
         commit_store::get_commits_after_sha(conn, repo.id, last_sha)
     })?;
 
-    // --dry-run without --reduce keeps the Phase 0 plan output.
-    if dry_run && !reduce {
+    // --dry-run without --reduce / --reduce-arch keeps the Phase 0 plan output.
+    if dry_run && !any_reduce {
         return print_dry_run(repo_name, last_sha, &unprocessed);
+    }
+
+    // --reduce-arch path (Phase 3 only): no classify, no changelog
+    // touch. Read existing cached classifications and regenerate
+    // architecture.md.
+    if reduce_arch && !reduce {
+        return reduce_architecture_and_render(
+            config, llm_config, &db, &repo, dry_run, force,
+        )
+        .await;
     }
 
     // --reduce path: run classify first (cache short-circuits the
@@ -116,7 +137,24 @@ pub async fn run(
                 last_sha.unwrap_or("(none)"),
             );
         }
-        return reduce_and_render(config, llm_config, &db, &repo, dry_run, force).await;
+        reduce_and_render(config, llm_config, &db, &repo, dry_run, force).await?;
+        if reduce_arch {
+            // `--reduce --reduce-arch` together: run the architecture
+            // reducer right after the changelog reducer so a single
+            // command can refresh both docs. Phase 5's `--reduce-all`
+            // will subsume this, but for now the explicit combo works.
+            reduce_architecture_and_render(
+                config, llm_config, &db, &repo, dry_run, force,
+            )
+            .await?;
+        } else {
+            // Hint operators that architecture is a separate flag for
+            // Phase 3. Phase 5 will combine these into `--reduce-all`.
+            println!(
+                "(architecture: not regenerated; pass --reduce-arch separately)"
+            );
+        }
+        return Ok(());
     }
 
     // --classify path (Phase 1 only): no reduce, no write.
@@ -908,6 +946,377 @@ async fn reduce_and_render(
     Ok(())
 }
 
+// ─────────────────────── Phase 3: architecture reducer ───────────────────────
+
+/// Path to the rendered architecture doc for `repo_name`. Same layout
+/// convention as [`changelog_doc_path`] but a different filename.
+pub(crate) fn architecture_doc_path(repo_name: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/cyuan".to_string());
+    PathBuf::from(home)
+        .join("projects/Shuozeli/docs")
+        .join(repo_name)
+        .join("architecture.md")
+}
+
+/// Default "manual notes" prefix for a fresh architecture.md (i.e. one
+/// pidx is creating from scratch). Empty on purpose — the architecture
+/// document is intended to be fully LLM-managed; users who want manual
+/// notes can prepend them above the marker after the first run.
+pub(crate) fn default_architecture_manual_prefix() -> String {
+    String::new()
+}
+
+/// Compute the reducer cache `input_hash` for the architecture doc.
+///
+/// Hashes:
+///   1. Every classification SHA passed to the reducer (the
+///      most-recent N), sorted lexically (so input order doesn't
+///      matter).
+///   2. The serialized snapshot JSON (so a directory reshuffle
+///      invalidates the cache even if no new commits landed).
+///   3. The reducer prompt version, in little-endian bytes (so a
+///      prompt bump invalidates every existing row).
+pub(crate) fn compute_architecture_input_hash(
+    classifications: &[ArchitectureClassificationContext],
+    snapshot: &RepoSnapshot,
+    prompt_version: u32,
+) -> String {
+    let mut shas: Vec<&str> = classifications.iter().map(|c| c.sha.as_str()).collect();
+    shas.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for s in shas {
+        hasher.update(s.as_bytes());
+        hasher.update(b"\n");
+    }
+    // Snapshot hash. We feed the JSON form because (a) the snapshot
+    // struct's `Serialize` impl is deterministic by virtue of sorted
+    // vecs, and (b) JSON survives serde additions without breaking
+    // the existing hash (new optional fields default to absent).
+    let snapshot_json = serde_json::to_string(snapshot).unwrap_or_default();
+    hasher.update(snapshot_json.as_bytes());
+    hasher.update(prompt_version.to_le_bytes());
+    let digest = hasher.finalize();
+    hex_lower(&digest)
+}
+
+/// Stitch the architecture LLM output into the full file body.
+///
+/// Mirrors [`render_full_changelog`]: manual prefix above the marker is
+/// preserved verbatim; the LLM output replaces everything below.
+pub(crate) fn render_full_architecture(
+    manual_prefix: &str,
+    architecture_body: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(manual_prefix);
+    if !manual_prefix.is_empty() && !manual_prefix.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(PIDX_MANAGED_MARKER);
+    out.push('\n');
+    out.push_str(PIDX_MANAGED_HINT);
+    out.push_str("\n\n");
+    out.push_str(architecture_body.trim_end());
+    out.push('\n');
+    out
+}
+
+/// Split an existing architecture.md into a manual prefix. Same shape
+/// as [`split_existing_changelog`].
+pub(crate) fn split_existing_architecture(content: &str) -> String {
+    if let Some(marker_pos) = content.find(PIDX_MANAGED_MARKER) {
+        let line_start = content[..marker_pos]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        content[..line_start].to_string()
+    } else {
+        // Marker not present yet — preserve whatever the user had.
+        let mut prefix = content.to_string();
+        if !prefix.is_empty() && !prefix.ends_with('\n') {
+            prefix.push('\n');
+        }
+        prefix
+    }
+}
+
+/// Pull the most-recent `limit` classifications for a repo, sorted in
+/// chronological order WITHIN the truncated window (so the prompt sees
+/// recent context oldest-first, which reads naturally as "what's been
+/// happening lately"). The DB query returns ascending; we take the
+/// last `limit` rows to get the window, which is already in the right
+/// order.
+pub(crate) fn select_recent_classifications(
+    all: &[crate::db::commit_classification_store::ClassificationWithCommit],
+    limit: usize,
+) -> Vec<ArchitectureClassificationContext> {
+    let start = all.len().saturating_sub(limit);
+    all[start..]
+        .iter()
+        .map(|c| ArchitectureClassificationContext {
+            sha: c.sha.clone(),
+            category: match c.category {
+                CommitCategory::Added => "Added",
+                CommitCategory::Changed => "Changed",
+                CommitCategory::Fixed => "Fixed",
+                CommitCategory::Removed => "Removed",
+                CommitCategory::Internal => "Internal",
+            }
+            .to_string(),
+            summary: c.summary.clone(),
+        })
+        .collect()
+}
+
+/// Run the Phase 3 reduce-render-write pipeline for architecture.md.
+///
+/// Reads classifications from `commit_classifications` (does NOT
+/// classify on its own), builds a fresh snapshot of the submodule
+/// working tree, calls `reduce_architecture` (cached on
+/// `(repo_id, "architecture", "all")` with the input hash combining
+/// SHAs + snapshot + prompt version), renders the doc, writes it.
+///
+/// Does NOT advance `last_processed_sha` — that cursor is the changelog
+/// reducer's contract; architecture re-runs are independent.
+async fn reduce_architecture_and_render(
+    config: &Config,
+    llm_config: &LlmConfig,
+    db: &Database,
+    repo: &RepoRow,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let _ = config;
+    println!("pidx changelog --reduce-arch --repo {}", repo.name);
+
+    // 1. Fetch classifications. Empty ⇒ fail loudly with the exact
+    //    command the operator needs.
+    let all = db.tx(|conn| {
+        commit_classification_store::get_classifications_for_repo(
+            conn,
+            repo.id,
+            CLASSIFY_PROMPT_VERSION,
+        )
+    })?;
+
+    if all.is_empty() {
+        bail!(
+            "No cached classifications for repo '{}'. \
+             Run `pidx changelog --repo {} --classify` first \
+             (Phase 3 only reduces; it does not classify on its own).",
+            repo.name,
+            repo.name,
+        );
+    }
+
+    let recent = select_recent_classifications(&all, ARCHITECTURE_CLASSIFICATION_LIMIT);
+
+    // 2. Build the snapshot from the submodule working tree.
+    let checkout = crate::llm::enrich::checkout_path(&repo.name);
+    if !checkout.join(".git").exists() {
+        bail!(
+            "Submodule for '{}' is not populated at {}. \
+             Run `git submodule update --init --recursive` from the \
+             Shuozeli superproject root.",
+            repo.name,
+            checkout.display(),
+        );
+    }
+    let snapshot = RepoSnapshot::from_path(&checkout).with_context(|| {
+        format!("Failed to build directory snapshot for {}", repo.name)
+    })?;
+
+    // 3. Cache lookup on `(repo_id, "architecture", "all")`.
+    let input_hash = compute_architecture_input_hash(
+        &recent,
+        &snapshot,
+        REDUCE_ARCHITECTURE_PROMPT_VERSION,
+    );
+
+    let mut cache_hit = false;
+    let architecture_body = if !force {
+        let cached = db.tx(|conn| {
+            doc_reducer_output_store::get_reducer_output(
+                conn,
+                repo.id,
+                "architecture",
+                "all",
+            )
+        })?;
+        if let Some(c) = cached
+            && c.input_hash == input_hash
+        {
+            cache_hit = true;
+            c.output
+        } else {
+            // 4. Cache miss: build the LLM client, call reduce_architecture.
+            call_reduce_architecture(
+                llm_config,
+                db,
+                repo,
+                &recent,
+                &snapshot,
+                &input_hash,
+            )
+            .await?
+        }
+    } else {
+        call_reduce_architecture(
+            llm_config,
+            db,
+            repo,
+            &recent,
+            &snapshot,
+            &input_hash,
+        )
+        .await?
+    };
+
+    // 5. Render + write. Manual notes preservation: anything above the
+    //    `<!-- pidx-managed -->` marker is kept verbatim.
+    let path = architecture_doc_path(&repo.name);
+    let existing = fs::read_to_string(&path).ok();
+    let manual_prefix = match &existing {
+        Some(c) => split_existing_architecture(c),
+        None => default_architecture_manual_prefix(),
+    };
+    let new_body = render_full_architecture(&manual_prefix, &architecture_body);
+
+    let (added, removed, unchanged) = match &existing {
+        Some(prev) => line_diff_stats(prev, &new_body),
+        None => (new_body.lines().count(), 0, 0),
+    };
+
+    let provider = llm_config.provider.clone();
+    let model = llm_config.model.clone();
+
+    if dry_run {
+        println!();
+        println!("Repo: {}", repo.name);
+        println!(
+            "Snapshot: {} root files, {} top-level dirs, {} markdown headings",
+            snapshot.root_files.len(),
+            snapshot.directories.len(),
+            snapshot.markdown_headings.len(),
+        );
+        println!(
+            "Recent classifications fed to reducer: {} (cap: {})",
+            recent.len(),
+            ARCHITECTURE_CLASSIFICATION_LIMIT,
+        );
+        println!(
+            "Cache: {}",
+            if cache_hit { "HIT (no LLM call)" } else { "MISS (would call LLM)" }
+        );
+        println!(
+            "Would write: {}  (+{} -{} ={} lines)",
+            path.display(),
+            added,
+            removed,
+            unchanged,
+        );
+        println!("(dry-run: no file written)");
+        let est_tokens = if cache_hit { 0 } else { 6500 };
+        println!("Tokens used: ~{est_tokens} (provider: {provider}, model: {model})");
+        return Ok(());
+    }
+
+    write_changelog_file(&path, &new_body).context(
+        "Failed to write architecture.md (path/permissions issue?)",
+    )?;
+
+    println!();
+    println!("Repo: {}", repo.name);
+    println!(
+        "Snapshot: {} root files, {} top-level dirs, {} markdown headings",
+        snapshot.root_files.len(),
+        snapshot.directories.len(),
+        snapshot.markdown_headings.len(),
+    );
+    println!(
+        "Recent classifications fed to reducer: {} (cap: {})",
+        recent.len(),
+        ARCHITECTURE_CLASSIFICATION_LIMIT,
+    );
+    println!(
+        "Cache: {}",
+        if cache_hit { "HIT (0 LLM calls)" } else { "MISS (1 LLM call)" }
+    );
+    println!(
+        "Wrote:    {}  (+{} -{} ={} lines)",
+        path.display(),
+        added,
+        removed,
+        unchanged,
+    );
+    let est_tokens = if cache_hit { 0 } else { 6500 };
+    println!("Tokens used: ~{est_tokens} (provider: {provider}, model: {model})");
+    Ok(())
+}
+
+/// LLM call + cache upsert for the architecture reducer. Pulled out so
+/// `--force` and the cache-miss branch share one body.
+async fn call_reduce_architecture(
+    llm_config: &LlmConfig,
+    db: &Database,
+    repo: &RepoRow,
+    recent: &[ArchitectureClassificationContext],
+    snapshot: &RepoSnapshot,
+    input_hash: &str,
+) -> anyhow::Result<String> {
+    let client = AnthropicCompatibleClient::from_config(llm_config)
+        .map_err(|e| anyhow::anyhow!("failed to construct LLM client: {e}"))?;
+    let provider = client.provider().to_string();
+    let model = client.model().to_string();
+
+    let req = ReduceArchitectureRequest {
+        repo_name: repo.name.clone(),
+        repo_description: repo.description.clone(),
+        snapshot: snapshot.clone(),
+        recent_classifications: recent.to_vec(),
+    };
+
+    let output = match client.reduce_architecture(req).await {
+        Ok(s) => s,
+        Err(LlmError::Auth(msg)) => bail!("LLM auth failed: {msg}"),
+        Err(LlmError::RateLimit { retry_after }) => bail!(
+            "LLM rate-limited (retry-after {:?}); abandoning architecture reduce",
+            retry_after,
+        ),
+        Err(e) => bail!(
+            "reduce_architecture failed for {}: {e}",
+            repo.name,
+        ),
+    };
+
+    if output.trim().is_empty() {
+        bail!(
+            "reduce_architecture returned an empty response for {}. \
+             Likely [llm].reduce_max_tokens is too low for the model's \
+             reasoning budget.",
+            repo.name,
+        );
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    db.tx(|conn| {
+        doc_reducer_output_store::upsert_reducer_output(
+            conn,
+            repo.id,
+            "architecture",
+            "all",
+            input_hash,
+            &output,
+            &provider,
+            &model,
+            now,
+        )
+    })?;
+
+    Ok(output)
+}
+
 /// Write the rendered changelog to `path`, creating the parent
 /// directory if needed. Pulled out so the write step is the explicit
 /// failure boundary that gates the `last_processed_sha` advance.
@@ -1479,6 +1888,275 @@ mod tests {
         assert_eq!(added, 1);
         assert_eq!(removed, 1);
         assert!(unchanged >= 2);
+    }
+
+    // ─────────────────── Phase 3 architecture reducer tests ───────────────────
+
+    use crate::llm::{
+        ArchitectureClassificationContext, RepoSnapshot,
+        snapshot::{DirEntry as SnapDirEntry, DirKind as SnapDirKind, MarkdownHeading,
+                   RootFileEntry},
+    };
+
+    fn empty_snapshot() -> RepoSnapshot {
+        RepoSnapshot {
+            root_files: vec![],
+            directories: vec![],
+            markdown_headings: vec![],
+        }
+    }
+
+    fn one_snapshot() -> RepoSnapshot {
+        RepoSnapshot {
+            root_files: vec![RootFileEntry {
+                path: "Cargo.toml".into(),
+                size_bytes: 100,
+            }],
+            directories: vec![SnapDirEntry {
+                path: "src".into(),
+                file_count: 5,
+                kind: SnapDirKind::Source,
+            }],
+            markdown_headings: vec![MarkdownHeading {
+                path: "README.md".into(),
+                heading: "My Repo".into(),
+            }],
+        }
+    }
+
+    fn arch_ctx(sha: &str, cat: &str, summary: &str) -> ArchitectureClassificationContext {
+        ArchitectureClassificationContext {
+            sha: sha.into(),
+            category: cat.into(),
+            summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn architecture_input_hash_is_order_independent_on_shas() {
+        // Arrange — same SHAs in different orders.
+        let snap = one_snapshot();
+        let a = vec![
+            arch_ctx("aaa1111", "Added", "x"),
+            arch_ctx("bbb2222", "Fixed", "y"),
+        ];
+        let b = vec![
+            arch_ctx("bbb2222", "Fixed", "y"),
+            arch_ctx("aaa1111", "Added", "x"),
+        ];
+
+        // Act
+        let h_a = compute_architecture_input_hash(&a, &snap, 1);
+        let h_b = compute_architecture_input_hash(&b, &snap, 1);
+
+        // Assert
+        assert_eq!(h_a, h_b, "input_hash must be order-independent on SHAs");
+    }
+
+    #[test]
+    fn architecture_input_hash_is_order_dependent_on_prompt_version() {
+        // Arrange
+        let snap = one_snapshot();
+        let cs = vec![arch_ctx("abc", "Added", "x")];
+
+        // Act
+        let h_v1 = compute_architecture_input_hash(&cs, &snap, 1);
+        let h_v2 = compute_architecture_input_hash(&cs, &snap, 2);
+
+        // Assert — bumping the prompt version invalidates the cache.
+        assert_ne!(h_v1, h_v2);
+    }
+
+    #[test]
+    fn architecture_input_hash_is_dependent_on_snapshot_content() {
+        // Arrange — same SHAs, two different snapshots.
+        let cs = vec![arch_ctx("abc", "Added", "x")];
+        let snap_a = empty_snapshot();
+        let snap_b = one_snapshot();
+
+        // Act
+        let h_a = compute_architecture_input_hash(&cs, &snap_a, 1);
+        let h_b = compute_architecture_input_hash(&cs, &snap_b, 1);
+
+        // Assert — directory reshuffles invalidate the cache even if no
+        // new commits landed.
+        assert_ne!(h_a, h_b);
+    }
+
+    #[test]
+    fn architecture_manual_notes_above_marker_are_preserved() {
+        // Arrange — pre-existing architecture.md with manual content.
+        let existing = format!(
+            "## My note: TEST_PRESERVE_ME_TOO\n\
+             \n\
+             {marker}\n\
+             {hint}\n\
+             \n\
+             # Architecture\n\n## Overview\nold body\n",
+            marker = PIDX_MANAGED_MARKER,
+            hint = PIDX_MANAGED_HINT,
+        );
+
+        // Act
+        let prefix = split_existing_architecture(&existing);
+        let new_body = render_full_architecture(
+            &prefix,
+            "# Architecture\n\n## Overview\nNEW body\n",
+        );
+
+        // Assert — the manual note survives; new body replaces old.
+        assert!(
+            new_body.contains("## My note: TEST_PRESERVE_ME_TOO"),
+            "manual note above marker must be preserved verbatim"
+        );
+        assert!(new_body.contains("NEW body"));
+        assert!(!new_body.contains("old body"));
+        assert!(new_body.contains(PIDX_MANAGED_MARKER));
+    }
+
+    #[test]
+    fn architecture_render_produces_marker_when_no_manual_prefix() {
+        // Arrange — fresh write, no existing file.
+        let prefix = default_architecture_manual_prefix();
+        let body = "# Architecture\n\n## Overview\nfresh\n";
+
+        // Act
+        let rendered = render_full_architecture(&prefix, body);
+
+        // Assert — marker present, content present, no orphan content above.
+        assert!(rendered.starts_with(PIDX_MANAGED_MARKER));
+        assert!(rendered.contains("# Architecture"));
+        assert!(rendered.contains("fresh"));
+    }
+
+    #[test]
+    fn architecture_split_treats_missing_marker_as_fully_manual() {
+        // Arrange — legacy file with no marker.
+        let existing = "# Old Architecture\n\nLegacy hand-written content.\n";
+
+        // Act
+        let prefix = split_existing_architecture(existing);
+
+        // Assert
+        assert!(prefix.contains("Legacy hand-written content."));
+    }
+
+    #[test]
+    fn architecture_cache_short_circuits_when_input_hash_matches() {
+        // Arrange — pre-seed `doc_reducer_outputs` with kind="architecture".
+        let conn = open_in_memory();
+        let repo_id: i64 = conn
+            .query_row("SELECT id FROM repos WHERE name='test-repo'", [], |r| r.get(0))
+            .unwrap();
+        let snap = one_snapshot();
+        let cs = vec![arch_ctx("abc", "Added", "x")];
+        let hash = compute_architecture_input_hash(&cs, &snap, REDUCE_ARCHITECTURE_PROMPT_VERSION);
+        doc_reducer_output_store::upsert_reducer_output(
+            &conn,
+            repo_id,
+            "architecture",
+            "all",
+            &hash,
+            "# Architecture\n\n## Overview\ncached content\n",
+            "minimax",
+            "MiniMax-M2",
+            1,
+        )
+        .unwrap();
+
+        // Act — recompute the hash and look it up.
+        let recomputed =
+            compute_architecture_input_hash(&cs, &snap, REDUCE_ARCHITECTURE_PROMPT_VERSION);
+        let cached = doc_reducer_output_store::get_reducer_output(
+            &conn,
+            repo_id,
+            "architecture",
+            "all",
+        )
+        .unwrap();
+
+        // Assert — hash matches, cached output served.
+        assert!(cached.is_some());
+        let row = cached.unwrap();
+        assert_eq!(row.input_hash, recomputed,
+            "cache hit short-circuit hinges on input_hash equality");
+        assert!(row.output.contains("cached content"));
+    }
+
+    #[test]
+    fn select_recent_classifications_respects_limit() {
+        // Arrange — 250 classifications, oldest-first.
+        let all: Vec<crate::db::commit_classification_store::ClassificationWithCommit> =
+            (0..250)
+                .map(|i| crate::db::commit_classification_store::ClassificationWithCommit {
+                    sha: format!("sha{:03}", i),
+                    committed_at: format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1),
+                    category: CommitCategory::Internal,
+                    summary: format!("commit {i}"),
+                    impact: CommitImpact::Minor,
+                })
+                .collect();
+
+        // Act
+        let recent = select_recent_classifications(&all, 200);
+
+        // Assert — exactly the last 200, in original (chronological)
+        // order within the window.
+        assert_eq!(recent.len(), 200);
+        // The chronologically-most-recent 200 are sha050..sha249.
+        assert_eq!(recent[0].sha, "sha050");
+        assert_eq!(recent[199].sha, "sha249");
+    }
+
+    #[test]
+    fn architecture_reduce_fails_loudly_when_no_classifications() {
+        // We can't drive the whole `reduce_architecture_and_render` in
+        // a unit test (it constructs an HTTP client), but we CAN pin
+        // the exact contract that the empty-cache check enforces:
+        // querying `commit_classifications` for an unknown repo
+        // returns an empty Vec, which the caller MUST translate into a
+        // user-facing error mentioning `--classify`.
+        //
+        // Arrange — fresh in-memory DB, no classifications.
+        let conn = open_in_memory();
+        let repo_id: i64 = conn
+            .query_row("SELECT id FROM repos WHERE name='test-repo'", [], |r| r.get(0))
+            .unwrap();
+
+        // Act
+        let all = commit_classification_store::get_classifications_for_repo(
+            &conn,
+            repo_id,
+            CLASSIFY_PROMPT_VERSION,
+        )
+        .unwrap();
+
+        // Assert — empty triggers the bail!() in `reduce_architecture_and_render`.
+        // The bail message is verified by inspection of the source; this
+        // test pins the precondition (empty Vec) that the caller checks.
+        assert!(all.is_empty(),
+            "fresh DB ⇒ no classifications ⇒ caller must bail with `--classify` hint");
+    }
+
+    #[test]
+    fn select_recent_classifications_caps_at_total_when_smaller_than_limit() {
+        // Arrange — only 5 classifications, limit = 200.
+        let all: Vec<crate::db::commit_classification_store::ClassificationWithCommit> =
+            (0..5)
+                .map(|i| crate::db::commit_classification_store::ClassificationWithCommit {
+                    sha: format!("sha{i}"),
+                    committed_at: "2026-01-01T00:00:00Z".into(),
+                    category: CommitCategory::Added,
+                    summary: format!("c{i}"),
+                    impact: CommitImpact::Minor,
+                })
+                .collect();
+
+        // Act
+        let recent = select_recent_classifications(&all, 200);
+
+        // Assert
+        assert_eq!(recent.len(), 5);
     }
 
     #[test]

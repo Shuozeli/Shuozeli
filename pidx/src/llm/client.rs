@@ -6,6 +6,7 @@ use serde_json::json;
 use crate::config::LlmConfig;
 
 use super::error::LlmError;
+use super::snapshot::DirKind;
 use super::types::{
     Classification, ClassifyRequest, CommitCategory, CommitImpact,
     ReduceArchitectureRequest, ReduceChangelogRequest,
@@ -34,6 +35,47 @@ Output rules — follow EXACTLY:
 6. Skip the `[Internal]` entries — they are context only and MUST NOT appear in the output. If, after dropping Internal, there are no entries at all in any section, output ONLY the `### Week of YYYY-MM-DD` header followed by the line `_no user-visible changes_`.
 7. Do NOT invent content. Every bullet must trace back to one or more provided summaries.
 8. Reply with ONLY the markdown — no code fences, no preamble, no commentary.
+"#;
+
+/// System prompt for `reduce_architecture`. Bumping any text here MUST
+/// be paired with a bump of
+/// [`crate::llm::REDUCE_ARCHITECTURE_PROMPT_VERSION`] — otherwise the
+/// `doc_reducer_outputs` cache would serve stale prose under the new
+/// prompt.
+const REDUCE_ARCHITECTURE_SYSTEM_PROMPT: &str = r#"You compose `architecture.md` for a single software project from a STRUCTURED INPUT that contains:
+
+  - The repository name (and optional one-line description).
+  - A directory snapshot: top-level files (with sizes), top-level directories (with file counts and a kind hint: Source/Tests/Docs/Examples/Config/Build/Other), and the first heading of every Markdown file (capped, sorted by path).
+  - The most-recent commit classifications (category + one-line summary). These are CONTEXT — recent things that have changed in the repo. Use them to pick the "Notable Design Decisions" section, NOT to enumerate commits.
+
+Output rules — follow EXACTLY:
+
+1. Reply with ONLY the markdown document. No code fences, no preamble, no commentary.
+2. Use this EXACT 5-section structure, in this order, with these EXACT level-2 headings:
+
+       # Architecture
+
+       ## Overview
+       <2-4 sentences describing what the project does>
+
+       ## Components
+       <bullet list of major modules / crates / top-level dirs with one-line descriptions>
+
+       ## Data Flow
+       <short narrative or compact ASCII diagram if appropriate>
+
+       ## Notable Design Decisions
+       <bullet list of 3-7 key decisions inferred from recent commits + repo shape>
+
+       ## Module Layout
+       <tree-style listing of important directories with brief descriptions>
+
+3. NEVER invent components that don't appear in the directory snapshot. The `Module Layout` section MUST reflect ONLY directories listed in the snapshot's `directories` field.
+4. Cite specific module / directory names from the snapshot when describing components (e.g. "`taskq-cp` — control-plane gRPC service").
+5. Bullets are <= 100 characters, no trailing period.
+6. The `## Notable Design Decisions` section should AGGREGATE recurring themes from the recent classifications (e.g. "Trait-based storage abstraction with SQLite + Postgres backends" if multiple commits touch both). Each bullet should be a DECISION, not a commit message.
+7. Do not invent file paths, languages, or frameworks that are not implied by the snapshot.
+8. Skip the `## Data Flow` ASCII diagram if you cannot infer one with high confidence — a short narrative is fine.
 "#;
 
 /// System prompt for `classify_commit`. Bumping any text here MUST be
@@ -266,6 +308,99 @@ pub(crate) fn render_reduce_changelog_prompt(
     out
 }
 
+/// Human-readable label for a [`DirKind`] — used in the architecture
+/// reducer prompt so the model can read the snapshot without parsing
+/// our enum names.
+fn dir_kind_label(k: DirKind) -> &'static str {
+    match k {
+        DirKind::Source => "Source",
+        DirKind::Tests => "Tests",
+        DirKind::Docs => "Docs",
+        DirKind::Examples => "Examples",
+        DirKind::Config => "Config",
+        DirKind::Build => "Build",
+        DirKind::Other => "Other",
+    }
+}
+
+/// Render the user message body for `reduce_architecture`. Pulled out
+/// so tests can pin the wire format without an HTTP client.
+///
+/// We hand the model a plain-text rendering of the snapshot rather
+/// than raw JSON — Anthropic-style models follow textual lists more
+/// reliably than nested objects, and the cache already pins the JSON
+/// hash so we don't need byte-for-byte fidelity from the prompt back
+/// to the snapshot struct.
+pub(crate) fn render_reduce_architecture_prompt(
+    req: &super::types::ReduceArchitectureRequest,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Repository: {}", req.repo_name);
+    if let Some(desc) = req.repo_description.as_deref() {
+        let _ = writeln!(out, "Description: {desc}");
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Top-level files");
+    if req.snapshot.root_files.is_empty() {
+        let _ = writeln!(out, "(none)");
+    } else {
+        for f in &req.snapshot.root_files {
+            let _ = writeln!(out, "- {} ({} bytes)", f.path, f.size_bytes);
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Top-level directories");
+    if req.snapshot.directories.is_empty() {
+        let _ = writeln!(out, "(none)");
+    } else {
+        for d in &req.snapshot.directories {
+            let _ = writeln!(
+                out,
+                "- {}/ ({} files, kind={})",
+                d.path,
+                d.file_count,
+                dir_kind_label(d.kind),
+            );
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Markdown headings (first H1/H2 per .md, capped)");
+    if req.snapshot.markdown_headings.is_empty() {
+        let _ = writeln!(out, "(none)");
+    } else {
+        for h in &req.snapshot.markdown_headings {
+            let _ = writeln!(out, "- {} -- {}", h.path, h.heading);
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(
+        out,
+        "## Recent commit classifications ({} entries, oldest first within window)",
+        req.recent_classifications.len()
+    );
+    if req.recent_classifications.is_empty() {
+        let _ = writeln!(out, "(none — repo has no classified commits yet)");
+    } else {
+        for c in &req.recent_classifications {
+            let _ = writeln!(
+                out,
+                "- [{}] {} {}",
+                c.category,
+                short_sha(&c.sha),
+                c.summary,
+            );
+        }
+    }
+
+    out
+}
+
 impl AnthropicCompatibleClient {
     /// Shared `POST /v1/messages` helper. Handles the wire envelope,
     /// status mapping (200/401/403/429/other), and the "no text block"
@@ -405,9 +540,25 @@ impl LlmClient for AnthropicCompatibleClient {
 
     fn reduce_architecture<'a>(
         &'a self,
-        _req: ReduceArchitectureRequest,
+        req: ReduceArchitectureRequest,
     ) -> LlmFuture<'a, String> {
-        Box::pin(async { Err(LlmError::NotImplemented) })
+        Box::pin(async move {
+            let user_content = render_reduce_architecture_prompt(&req);
+
+            let text = self
+                .call_messages(
+                    REDUCE_ARCHITECTURE_SYSTEM_PROMPT,
+                    &user_content,
+                    self.reduce_max_tokens,
+                    "architecture reducer",
+                    "reduce_max_tokens",
+                )
+                .await?;
+
+            // Defensively strip any code fences the model might wrap
+            // the markdown in, mirroring `reduce_changelog`.
+            Ok(strip_markdown_fences(&text).to_string())
+        })
     }
 
     fn reduce_description<'a>(

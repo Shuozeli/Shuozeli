@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::snapshot::RepoSnapshot;
+
 /// Categories used in the changelog reducer (Keep-a-Changelog flavored).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -80,16 +82,34 @@ pub struct ReduceChangelogRequest {
     pub prompt_version: u32,
 }
 
+/// One classification entry passed to the architecture reducer.
+/// Carries enough context for the model to spot recurring themes
+/// without needing the full diffs (which would blow the token budget).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchitectureClassificationContext {
+    pub sha: String,
+    /// "Added" / "Changed" / "Fixed" / "Removed" / "Internal".
+    pub category: String,
+    pub summary: String,
+}
+
 /// Inputs for the whole-repo architecture reducer.
+///
+/// Phase 3 wire shape: pidx hands the model a structured snapshot of
+/// the repo's current shape PLUS the most-recent `N` classifications
+/// (sorted by commit date desc, capped by `ARCHITECTURE_CLASSIFICATION_LIMIT`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReduceArchitectureRequest {
     pub repo_name: String,
-    /// Recent classifications, oldest-first, used to bias the rewrite
-    /// toward what changed lately.
-    pub classifications: Vec<Classification>,
-    /// Top-level files + first heading of each `.md` — see design doc.
-    pub directory_snapshot: String,
-    pub prompt_version: u32,
+    /// One-line description if known (e.g. from `pidx.toml` override
+    /// or a README's first paragraph). `None` when pidx has no
+    /// description for this repo.
+    pub repo_description: Option<String>,
+    pub snapshot: RepoSnapshot,
+    /// Most-recent classifications, oldest-first within the truncated
+    /// window. The reducer prompt instructs the model to mine these
+    /// for "Notable Design Decisions".
+    pub recent_classifications: Vec<ArchitectureClassificationContext>,
 }
 
 /// Inputs for the one-line description reducer (writes back into

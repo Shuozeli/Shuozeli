@@ -12,14 +12,16 @@
 mod client;
 pub mod enrich;
 mod error;
+pub mod snapshot;
 mod types;
 
 pub use client::AnthropicCompatibleClient;
 pub use enrich::{EnrichError, EnrichedCommit, FileDiff, enrich_commit, render_for_prompt};
 pub use error::LlmError;
+pub use snapshot::{DirEntry, DirKind, MarkdownHeading, RepoSnapshot, RootFileEntry};
 pub use types::{
-    Classification, ClassifyRequest, CommitCategory, CommitImpact,
-    ReduceArchitectureRequest, ReduceChangelogRequest,
+    ArchitectureClassificationContext, Classification, ClassifyRequest, CommitCategory,
+    CommitImpact, ReduceArchitectureRequest, ReduceChangelogRequest,
     ReduceChangelogWeekClassification, ReduceDescriptionRequest,
 };
 
@@ -45,6 +47,22 @@ pub const CLASSIFY_PROMPT_VERSION: u32 = 1;
 /// the bump, the reducer would happily serve stale prose under the new
 /// prompt.
 pub const REDUCE_CHANGELOG_PROMPT_VERSION: u32 = 1;
+
+/// Version of the `reduce_architecture` system prompt + output format.
+///
+/// **Bump this whenever the architecture reducer prompt text, snapshot
+/// shape, or expected markdown structure changes.** The
+/// `doc_reducer_outputs.input_hash` for `kind="architecture"` mixes
+/// this constant in alongside the sorted classification SHAs and the
+/// snapshot hash, so a bump invalidates every cached architecture
+/// document on the next run. Without the bump, the reducer would serve
+/// stale prose under the new prompt.
+pub const REDUCE_ARCHITECTURE_PROMPT_VERSION: u32 = 1;
+
+/// Maximum number of recent classifications passed to the architecture
+/// reducer. Architecture wants enough recent context to understand the
+/// current shape; older history is noise and bloats the token budget.
+pub const ARCHITECTURE_CLASSIFICATION_LIMIT: usize = 200;
 
 /// Result alias for trait methods. Boxed so the trait stays object-safe
 /// without depending on `async_trait` (we don't need dyn dispatch in
