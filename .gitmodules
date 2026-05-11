@@ -1,6 +1,0 @@
-[submodule "taskq-rs"]
-	path = taskq-rs
-	url = git@github.com:Shuozeli/taskq-rs.git
-[submodule "docs/taskq-rs"]
-	path = docs/taskq-rs
-	url = git@github.com:Shuozeli/taskq-rs.git
