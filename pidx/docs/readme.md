@@ -20,6 +20,11 @@ The config file at `~/.pidx/pidx.toml` supports:
 - `[[categories]]` -- Define category keys and display titles (e.g., `key = "devtools"`, `title = "Developer Tools"`).
 - `[[repos]]` -- Each entry has `name`, `category`, and optional `description` (overrides the GitHub description in the generated index).
 
+If a non-empty `FEATURED.md` exists beside the generated index, `pidx index`
+preserves it between the generated timestamp and the active-project tables.
+This keeps a hand-maintained launch or featured-project section visible without
+embedding project-specific copy in the generator.
+
 ## Usage
 
 ```bash
